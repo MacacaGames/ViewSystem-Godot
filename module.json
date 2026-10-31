@@ -1,0 +1,16 @@
+{
+  "id": "com.macacagames.viewsystem.godot",
+  "version": "0.5.1",
+  "delivery": "Git submodule pinned to commit/tag, or deterministic Godot source-plugin ZIP",
+  "dependencies": [
+    "Godot.NET.Sdk 4.7.2"
+  ],
+  "authority": "hand-maintained native/source module; generated compiler outputs are disposable",
+  "entrypoint": "Editor/ViewSystemEditor.cs",
+  "runtime": "ViewHost + ViewCatalog + ViewComposer; no Autoload or external package required",
+  "projectSettings": {
+    "macaca_viewsystem/catalog": "optional res:// catalog path; no game-specific default"
+  },
+  "repository": "https://github.com/MacacaGames/ViewSystem-Godot",
+  "license": "MIT"
+}

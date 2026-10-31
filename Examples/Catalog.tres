@@ -1,0 +1,11 @@
+[gd_resource type="Resource" script_class="ViewCatalog" format=3]
+[ext_resource type="Script" path="res://addons/macaca_viewsystem/ViewCatalog.cs" id="catalog"]
+[ext_resource type="Script" path="res://addons/macaca_viewsystem/ViewEntry.cs" id="entry"]
+[ext_resource type="PackedScene" path="res://addons/macaca_viewsystem/Examples/Page.tscn" id="page"]
+[sub_resource type="Resource" id="welcome"]
+script = ExtResource("entry")
+Id = "Welcome"
+Scene = ExtResource("page")
+[resource]
+script = ExtResource("catalog")
+Entries = Array[ExtResource("entry")]([SubResource("welcome")])

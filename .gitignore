@@ -1,0 +1,8 @@
+.godot/
+.tools/
+artifacts/
+**/bin/
+**/obj/
+**/__pycache__/
+.DS_Store
+*.user
