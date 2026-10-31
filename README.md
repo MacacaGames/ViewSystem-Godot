@@ -10,7 +10,7 @@ Godot .NET 的 Page／State／Overlay 組合與視覺化編輯工具。Editor �
 
 ```sh
 git submodule add git@github.com:MacacaGames/ViewSystem-Godot.git addons/macaca_viewsystem
-git -C addons/macaca_viewsystem checkout --detach v0.5.1
+git -C addons/macaca_viewsystem checkout --detach v0.6.0
 git add .gitmodules addons/macaca_viewsystem
 ```
 
@@ -43,7 +43,7 @@ python3 Tools/package.py --output /path/to/output
   "addons": {
     "macaca_viewsystem": {
       "url": "git@github.com:MacacaGames/ViewSystem-Godot.git",
-      "checkout": "v0.5.1",
+      "checkout": "v0.6.0",
       "subfolder": "/"
     }
   }
@@ -76,7 +76,7 @@ Rect Transform 的縮圖按鈕開啟16種預設；固定軸顯示 Pos X/Y、Widt
 
 | 資料 | 用途 |
 | --- | --- |
-| `ViewCatalog` | 全部定義與 Shared 預覽資料 |
+| `ViewCatalog` | 全部定義、Shared 預覽資料與可選 Action 宣告 |
 | `ViewEntry` | ID、Kind、Scene、State 群組、排序、元件、Overrides、Events、預覽資料、動畫 |
 | `ViewElementPlacement` | 穩定 ID、顯示名稱、NodeName、共用 Scene、ParentPath／SiblingIndex、此次放置的 Layout／Overrides／Events、GUID／fileID／原 ViewPageItem 身分 |
 | `ViewElementLayout` | 放置根節點的 anchors／offsets／pivot／scale／rotation／ZIndex；Container 管理的項目留空 |
@@ -121,11 +121,9 @@ OnBeforeLeave → OnStartLeave → HideAnimation → OnHidden → 釋放
 RefreshView：保留的 State 在換頁後重新綁定
 ```
 
-`ViewHost.ShowHooks` 接受 `IViewPageShowHook`：
-`BeforePrepareAsync` 在實例建立前等待；`AfterReadyAsync` 在入場與 OnShown 完成後等待。
-若 commit 前失敗或取消，對已進入的 hooks 反序呼叫 `OnAborted`、釋放新實例並保留舊頁。
-hooks 應遵守 cancellation token；同一個 host 會序列化導航，hook 內不可 await 該 host 的另一個導航請求。
-commit 後的離場或 State refresh 錯誤會回報，已啟用的新頁仍由 host 擁有。
+`ShowPageAsync`／`ShowOverlayAsync` 不論是否設定 `ProjectTransitions` 都使用同一交易：準備、新State注入、入場及AfterReady成功後才commit；commit前取消／失敗保留舊頁，清理候選所有權並反序執行OnAborted。commit後的State刷新／舊頁清理錯誤用ViewNavigationCommittedException明確回報，不回復舊頁。
+
+同步ActivatePage／ActivateOverlay先完成組裝與State入場準備再commit，保留入場／退場重疊；其Ready失敗發生於commit之後，不回復舊頁。完整取消、hook、cleanup及互斥合約見 [NAVIGATION.md](NAVIGATION.md)。
 
 Show／Hide 動畫使用定義上的 `AnimationPlayerPath`、`ShowAnimation`、`HideAnimation`。
 動畫須存在且不能循環；取消時停止等待並清理候選實例。
@@ -138,7 +136,7 @@ Scene 裡的 Godot `[Tool]`／`@tool` 腳本仍會依引擎規則執行，必須
 
 Placement 的 `LayoutData` 使用原生 Resource metadata schema1，透過 `ViewElementLayout` 取得型別化存取。工作區負責組合與 placement layout；共享外觀直接在 Godot 2D Editor 編輯來源子場景。Container 與原生 Control 的最小尺寸規則仍有效。
 
-支援 Page／State、Overlay、動態 Element、typed Model、Overrides、零參數 signal、生命週期與動畫。Unity MacacaViewSystem API 並非全部移植：任意 breakpoint／flag mask、Custom Parent hierarchy picker、safe-area 模擬、整個 item 的事件／覆寫剪貼簿、pooling、任意參數 signal、attribute injection 與 Shift／Alt preset 額外語義仍未提供。Transform Pick／Copy／Paste 不改來源身分、Overrides 或 Events。
+支援 Page／State、Overlay、動態 Element、typed Model、Overrides、零參數 signal、生命週期與動畫。Unity MacacaViewSystem API 並非全部移植：任意 breakpoint／flag mask、safe-area 模擬、整個 item 的事件／覆寫剪貼簿、pooling、任意參數 signal、attribute injection 與 Shift／Alt preset 額外語義仍未提供。Transform Pick／Copy／Paste 不改來源身分、Overrides 或 Events。
 
 Godot 資源 wrapper／GC 問題參考 [godotengine/godot#112067](https://github.com/godotengine/godot/issues/112067)。Catalog 在文件生命週期內保留 wrappers；熱重載以短暫 native references 交接，沒有全域永久快取。非互動 `--import`／`--quit`／`--export-*` 不建立預覽工作區。
 
@@ -153,3 +151,12 @@ python3 Tools/verify.py --godot /path/to/Godot --dotnet /path/to/dotnet --output
 需要 Python 3.9+、Godot 4.7.2 .NET 與 SDK8。預設從 NuGet 還原；離線時可傳 `--nuget-source /path/to/pinned/nupkgs`。工具驗證乾淨宿主建置、命名空間隔離、實際 runtime 與 GUI Editor 範例、輸出 screenshot 與 JSON；GUI階段需要可用桌面。較完整產品整合／熱重載測試由消費端維護，不冒充這個 smoke 的覆蓋範圍。
 
 修改之後重新執行驗證、更新版本／CHANGELOG，再建立不重用的 tag。原始移植來源與公告見 [NOTICE.md](NOTICE.md)、授權見 [LICENSE](LICENSE)。
+
+
+## Authoring pickers（0.6）
+
+Target、Property、Signal、Action旁的「…」提供可搜尋選單，「↗」定位預覽節點，或在檔案系統與Inspector顯示應用程式的派送宣告。Property從實際選取節點及Resource子路徑取得型別，選取後填入對應Value kind。仍可直接輸入路徑／值。帶參數signal顯示但停用，payload binding仍未提供。
+
+Element的Parent只列本項目前已存在的Control，排除自身子樹及後續placement，支援Undo／Redo及存重開。Container擁有排版時必須先交回原生layout，不能同時套用placement Layout。定位框使用Node2D，不參與Container排版。
+
+Catalog.Actions可選擇宣告ViewActionDefinition（Id、HandlerScript、HandlerMethod）；Editor以實際Script方法metadata核對並提供來源定位。宣告後，Events必須使用已宣告ID。沒有宣告時，Action選單取自既有bindings並保留文字輸入。這是宿主提供的派送對照，runtime仍由ActionRequested交給應用程式處理；plugin不依賴任何遊戲類別、不建立service locator。應用程式須確保其dispatcher處理每個已宣告ID。

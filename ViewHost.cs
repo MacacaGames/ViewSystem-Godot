@@ -81,7 +81,6 @@ public partial class ViewHost : Control
         => ShowAsync(id, true, model, token);
     private async Task<ViewInstance> ShowAsync(string id, bool overlay, ViewModels? model, CancellationToken token)
     {
-        if (ProjectTransitions != null) return await ShowDeliveredAsync(id, overlay, model, token);
         Initialize();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, token);
         token = linked.Token;
@@ -90,104 +89,131 @@ public partial class ViewHost : Control
         var request = new ViewPageShowContext(id, overlay, context);
         await gate.WaitAsync(token);
         var invoked = new List<IViewPageShowHook>();
-        ViewInstance? candidate = null;
+        var candidates = new List<ViewInstance>();
+        var started = new HashSet<ViewInstance>();
+        var nextStates = new Dictionary<string, ViewInstance>(StringComparer.Ordinal);
+        ViewInstance? result = null;
+        Exception? failure = null;
         bool committed = false;
-        var newStates = new Dictionary<string, ViewInstance>(StringComparer.Ordinal);
+        var cleanupErrors = new List<Exception>();
         try
         {
-            foreach (var hook in ShowHooks)
+            IsTransitioning = true;
+            foreach (var hook in ShowHooks.ToArray())
             { token.ThrowIfCancellationRequested(); invoked.Add(hook); await hook.BeforePrepareAsync(request, token); }
             token.ThrowIfCancellationRequested();
-            candidate = Mount(entry, context, overlay ? overlayLayer : pageLayer);
+            result = Mount(entry, context, overlay ? overlayLayer : pageLayer); candidates.Add(result);
             if (!overlay)
-                foreach (var definition in Catalog.Entries.Where(e => e.Kind == ViewKind.State && e.State == entry.State && entry.State.Length != 0))
-                    if (!states.ContainsKey(definition.Id)) newStates.Add(definition.Id, Mount(definition, context, stateLayer));
-            foreach (var state in newStates.Values) await EnterAsync(state, token);
-            await EnterAsync(candidate, token);
-            foreach (var hook in invoked) { token.ThrowIfCancellationRequested(); await hook.AfterReadyAsync(request, token); }
+                foreach (var definition in StateDefinitions(entry))
+                    if (StateNeedsCreation(definition.Id))
+                    { var state = Mount(definition, context, stateLayer); nextStates.Add(definition.Id, state); candidates.Add(state); }
+            foreach (var state in nextStates.Values)
+            {
+                started.Add(state); state.Ready = EnterCandidateAsync(state, token);
+                await state.Ready;
+            }
+            started.Add(result); result.Ready = EnterCandidateAsync(result, token);
+            await result.Ready;
+            foreach (var hook in invoked)
+            { token.ThrowIfCancellationRequested(); await hook.AfterReadyAsync(request, token); }
             token.ThrowIfCancellationRequested();
 
-            var result = candidate;
-            if (overlay) { overlays.Add(candidate); candidate = null; committed = true; }
+            if (overlay) { overlays.Add(result); committed = true; }
             else
             {
+                // No await or user callback is allowed between these ownership assignments.
                 var previous = CurrentPage;
-                CurrentPage = candidate;
-                candidate = null; committed = true;
-                foreach (var pair in newStates) states.Add(pair.Key, pair.Value);
-                newStates.Clear();
-                var cleanupErrors = new List<Exception>();
-                foreach (var pair in states.ToArray())
-                {
-                    try
-                    {
-                        if (pair.Value.Definition.State != entry.State)
-                        { states.Remove(pair.Key); await LeaveAsync(pair.Value, lifetime.Token); }
-                        else if (!ReferenceEquals(pair.Value.Context, context))
-                        { pair.Value.Rebind(context); pair.Value.Lifecycle(p => p.RefreshView()); }
-                    }
+                var obsolete = states.Where(p => p.Value.Definition.State != entry.State || nextStates.ContainsKey(p.Key)).ToArray();
+                CurrentPage = result; PageReady = result.Ready; ++activationGeneration;
+                foreach (var pair in obsolete) states.Remove(pair.Key);
+                foreach (var pair in nextStates) states.Add(pair.Key, pair.Value);
+                committed = true;
+                foreach (var state in states.Values.Where(v => !nextStates.ContainsKey(v.Definition.Id)))
+                    try { state.Rebind(context); state.Lifecycle(p => p.RefreshView()); }
                     catch (Exception error) { cleanupErrors.Add(error); }
-                }
-                if (previous != null)
-                    try { await LeaveAsync(previous, lifetime.Token); } catch (Exception error) { cleanupErrors.Add(error); }
-                if (cleanupErrors.Count > 0) throw new AggregateException("Page committed, but outgoing cleanup or state refresh failed.", cleanupErrors);
+                foreach (var outgoing in obsolete.Select(p => p.Value).Concat(previous == null ? Array.Empty<ViewInstance>() : new[] { previous }))
+                    try { await RetireDelivered(outgoing, false); } catch (Exception error) { cleanupErrors.Add(error); }
+                if (cleanupErrors.Count > 0) throw new ViewNavigationCommittedException(entry.Id, false, cleanupErrors);
             }
-            return result;
         }
-        catch
-        {
-            foreach (var hook in committed ? Enumerable.Empty<IViewPageShowHook>() : invoked.AsEnumerable().Reverse())
-                try { hook.OnAborted(request); } catch (Exception error) { GD.PushError(error.ToString()); }
-            throw;
-        }
+        catch (Exception error) { failure = error; }
         finally
         {
-            if (candidate != null) await candidate.DisposeAsync();
-            foreach (var state in newStates.Values) await state.DisposeAsync();
-            gate.Release();
+            try
+            {
+                if (!committed)
+                {
+                    foreach (var hook in invoked.AsEnumerable().Reverse())
+                        try { hook.OnAborted(request); } catch (Exception error) { cleanupErrors.Add(error); }
+                    foreach (var candidate in candidates.AsEnumerable().Reverse())
+                        await AbortCandidateAsync(candidate, started.Contains(candidate), cleanupErrors);
+                }
+            }
+            finally { IsTransitioning = CurrentPage?.Ready.IsCompleted == false; gate.Release(); }
         }
+        if (failure != null)
+        {
+            if (!committed && cleanupErrors.Count > 0)
+                throw new AggregateException("Navigation failed and rollback reported errors.", new[] { failure }.Concat(cleanupErrors));
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+        return result!;
     }
+    private bool StateNeedsCreation(string id)
+        => !states.TryGetValue(id, out var state) || state.Ready.IsFaulted || state.Ready.IsCanceled;
+    private IEnumerable<ViewEntry> StateDefinitions(ViewEntry page)
+        => Catalog.Entries.Where(e => e.Kind == ViewKind.State && page.State.Length != 0 && e.State == page.State);
     private ViewInstance Mount(ViewEntry entry, ViewContext context, Control layer)
     {
         var instance = CreateOwned(entry, context);
-        instance.Root.Visible = false;
-        layer.AddChild(instance.Root);
-        return instance;
-    }
-    private static async Task EnterAsync(ViewInstance instance, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        instance.Lifecycle(p => p.OnBeforeShow());
-        instance.Root.Show(); instance.Lifecycle(p => p.OnStartShow());
-        await instance.AnimateAsync(true, token);
-        token.ThrowIfCancellationRequested(); instance.Lifecycle(p => p.OnShown());
-    }
-    private static async Task LeaveAsync(ViewInstance instance, CancellationToken token)
-    {
         try
         {
-            instance.Lifecycle(p => p.OnBeforeLeave());
-            instance.Lifecycle(p => p.OnStartLeave());
-            await instance.AnimateAsync(false, token);
-            instance.Root.Hide(); instance.Lifecycle(p => p.OnHidden());
+            instance.ValidateAnimations(); instance.Root.Visible = false; layer.AddChild(instance.Root);
+            return instance;
         }
-        finally { await instance.DisposeAsync(); }
+        catch (Exception failure)
+        {
+            owned.Remove(instance.Root); var errors = new List<Exception>();
+            try { ReleaseNestedElements(instance); } catch (Exception error) { errors.Add(error); }
+            try { instance.Dispose(); } catch (Exception error) { errors.Add(error); }
+            if (errors.Count > 0) throw new AggregateException("Mount failed and cleanup reported errors.", new[] { failure }.Concat(errors));
+            throw;
+        }
+    }
+    private void BeginEntry(ViewInstance instance)
+    {
+        instance.Lifecycle(p => p.OnBeforeShow()); instance.Root.Show(); instance.Lifecycle(p => p.OnStartShow());
+    }
+    private async Task EnterCandidateAsync(ViewInstance instance, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested(); BeginEntry(instance);
+        await instance.AnimateAsync(true, token);
+        double duration = instance.Definition.Kind == ViewKind.Overlay ? ProjectTransitions?.OverlayEnterDuration(instance.Root) ?? 0 :
+            instance.Definition.Kind == ViewKind.Page ? ProjectTransitions?.EnterDuration(instance.Root) ?? 0 : 0;
+        ValidateDuration(duration);
+        if (duration > 0) await ViewController.TweenDelay(instance.Root, duration, token);
+        token.ThrowIfCancellationRequested(); instance.Lifecycle(p => p.OnShown());
+    }
+    private static void ValidateDuration(double duration)
+    { if (!double.IsFinite(duration) || duration < 0) throw new InvalidOperationException("Invalid entry duration."); }
+    private async Task AbortCandidateAsync(ViewInstance candidate, bool started, List<Exception> errors)
+    {
+        if (started)
+            foreach (var callback in new Action<IViewElementLifeCycle>[] { p => p.OnBeforeLeave(), p => p.OnStartLeave(), p => p.OnHidden() })
+                try { candidate.CleanupLifecycle(callback); } catch (Exception error) { errors.Add(error); }
+        try { ReleaseNestedElements(candidate); } catch (Exception error) { errors.Add(error); }
+        leaving.Remove(candidate); owned.Remove(candidate.Root);
+        try { await candidate.DisposeAsync(); } catch (Exception error) { errors.Add(error); }
     }
     public async Task DismissOverlayAsync(ViewInstance overlay, CancellationToken token = default)
     {
-        if (ProjectTransitions != null)
-        {
-            token.ThrowIfCancellationRequested();
-            await DismissDeliveredOverlayAsync(overlay.Root).WaitAsync(token);
-            return;
-        }
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, token);
         token = linked.Token;
         await gate.WaitAsync(token);
         try
         {
             if (!overlays.Remove(overlay)) throw new InvalidOperationException("Overlay does not belong to this host.");
-            await LeaveAsync(overlay, token);
+            await RetireDelivered(overlay, true);
         }
         finally { gate.Release(); }
     }

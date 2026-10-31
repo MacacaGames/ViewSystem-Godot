@@ -26,13 +26,13 @@ public static class ViewComposer
                     throw new InvalidOperationException($"{entry.Id}: duplicate element '{placement.Id}'.");
                 var parent = root.GetNodeOrNull(placement.ParentPath)
                     ?? throw new InvalidOperationException($"{entry.Id}/{placement.Id}: parent '{placement.ParentPath}' is missing.");
-                var element = InstantiateControl(placement.Scene, entry.Id + "/" + placement.Id);
                 if (placement.NodeName.Length != 0)
                 {
                     if (parent.HasNode(new NodePath(placement.NodeName)))
                         throw new InvalidOperationException($"{entry.Id}: duplicate authored node name '{placement.NodeName}'.");
-                    element.Name = placement.NodeName;
                 }
+                var element = InstantiateControl(placement.Scene, entry.Id + "/" + placement.Id);
+                if (placement.NodeName.Length != 0) element.Name = placement.NodeName;
                 parent.AddChild(element);
                 if (placement.SiblingIndex >= 0) parent.MoveChild(element, Math.Min(placement.SiblingIndex,parent.GetChildCount()-1));
                 instance.Elements.Add(placement.Id, element);
@@ -171,6 +171,25 @@ public sealed class ViewInstance : IDisposable, IAsyncDisposable
     {
         if (Context.IsPreview) return;
         foreach (var node in OwnedWalk(Root)) if (node is IViewElementLifeCycle participant) callback(participant);
+    }
+    internal void CleanupLifecycle(Action<IViewElementLifeCycle> callback)
+    {
+        if (Context.IsPreview || !GodotObject.IsInstanceValid(Root)) return;
+        var errors = new List<Exception>();
+        foreach (var node in OwnedWalk(Root).ToArray())
+            if (node is IViewElementLifeCycle participant)
+                try { callback(participant); } catch (Exception error) { errors.Add(error); }
+        if (errors.Count > 0) throw new AggregateException("View lifecycle cleanup failed.", errors);
+    }
+    internal void ValidateAnimations()
+    {
+        foreach (string name in new[] { Definition.ShowAnimation, Definition.HideAnimation }.Where(n => n.Length > 0))
+        {
+            var player = Root.GetNodeOrNull<AnimationPlayer>(Definition.AnimationPlayerPath)
+                ?? throw new InvalidOperationException($"{Definition.Id}: animation player is missing.");
+            if (!player.HasAnimation(name) || player.GetAnimation(name).LoopMode != Animation.LoopModeEnum.None)
+                throw new InvalidOperationException($"{Definition.Id}: animation '{name}' must exist and must not loop.");
+        }
     }
     public async Task AnimateAsync(bool show, CancellationToken token)
     {

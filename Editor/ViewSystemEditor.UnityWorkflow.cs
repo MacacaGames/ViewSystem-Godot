@@ -114,21 +114,22 @@ public partial class ViewSystemEditor
         Button(layout,"編輯子場景","PlacementScene",OpenSource);
         var overrides=InspectorPage("覆寫");
         rules=new ItemList { Name="Overrides",CustomMinimumSize=new Vector2(0,120) };overrides.AddChild(rules);ConnectUi(rules,ItemList.SignalName.ItemSelected,nameof(OnRuleSelected));
-        target=LabeledField(overrides,"Target 節點","Target","節點路徑（. 代表選取項目根節點）",".");
-        property=LabeledField(overrides,"Property 屬性","Property","Godot 屬性，例如 text、modulate","text");
+        target=LabeledField(overrides,"Target","Target","節點路徑（. 代表選取項目根節點）",".");
+        property=LabeledField(overrides,"Property","Property","Godot 屬性，例如 text、modulate","text");
         kinds=new OptionButton { Name="ValueKind" };foreach(var kind in Enum.GetNames<ViewValueKind>())kinds.AddItem(kind);overrides.AddChild(kinds);
-        value=LabeledField(overrides,"Value 固定值","Value","值；Color 用 #RRGGBBAA；Vector2 用 x,y","");
-        modelKey=LabeledField(overrides,"Model key 資料綁定","ModelKey","Model key；留空代表固定值","");
+        value=LabeledField(overrides,"Value","Value","值；Color 用 #RRGGBBAA；Vector2 用 x,y","");
+        modelKey=LabeledField(overrides,"Model key","ModelKey","Model key；留空代表固定值","");
         scopes=new OptionButton { Name="Scope" };foreach(var scope in Enum.GetNames<ViewInjectScope>())scopes.AddItem(scope);overrides.AddChild(scopes);
         var ruleBar=new HBoxContainer();overrides.AddChild(ruleBar);
         Button(ruleBar,"新增","NewOverride",()=>{selectedRule=-1;rules.DeselectAll();target.Text=".";property.Text="text";value.Text="";modelKey.Text="";});
         Button(ruleBar,"套用","ApplyOverride",()=>Try(ApplyRule));Button(ruleBar,"移除","RemoveOverride",RemoveRule);
         var events=InspectorPage("事件");
         eventBindings=new ItemList { Name="EventBindings",CustomMinimumSize=new Vector2(0,140) };events.AddChild(eventBindings);ConnectUi(eventBindings,ItemList.SignalName.ItemSelected,nameof(OnEventSelected));
-        eventTarget=LabeledField(events,"Target 節點","EventTarget","Button 相對路徑",".");eventSignal=LabeledField(events,"Signal","EventSignal","零參數 signal，例如 pressed","pressed");eventAction=LabeledField(events,"Action","EventAction","Action，例如 OnPlayButtonClick","");
+        eventTarget=LabeledField(events,"Target","EventTarget","Button 相對路徑",".");eventSignal=LabeledField(events,"Signal","EventSignal","零參數 signal，例如 pressed","pressed");eventAction=LabeledField(events,"Action","EventAction","Action，例如 OnPlayButtonClick","");
         var eventBar=new HBoxContainer();events.AddChild(eventBar);
         Button(eventBar,"新增","NewEvent",()=>{selectedEvent=-1;eventBindings.DeselectAll();eventTarget.Text=".";eventSignal.Text="pressed";eventAction.Text="";});
         Button(eventBar,"套用","ApplyEvent",()=>Try(ApplyEvent));Button(eventBar,"移除","RemoveEvent",RemoveEvent);
+        BuildAuthoringPickers(items);
         status=new Label { Name="Status",AutowrapMode=TextServer.AutowrapMode.WordSmart };panel.AddChild(status);
         // Preview remains the first-use default; the relationship graph is one tab away.
         workspaceTabs.CurrentTab=1;
@@ -186,6 +187,7 @@ public partial class ViewSystemEditor
         if(elements.Selected>=0 && elements.Selected<viewItems.ItemCount)viewItems.Select(elements.Selected);
         RefreshPlacementLayout();
         RefreshEvents();
+        RefreshAuthoringSelection();
     }
     private void RefreshPlacementLayout()
     {
@@ -378,10 +380,10 @@ public partial class ViewSystemEditor
     }
     private void ResetGraphLayout()
     {if(catalog==null)return;EditorInterface.Singleton.GetEditorSettings().SetProjectMetadata("macaca_viewsystem",catalog.ResourcePath,new Godot.Collections.Dictionary());RebuildGraph();}
-    private IEnumerable<LineEdit> EditorFormFields()=>new[]{catalogPath,target,property,value,modelKey,definitionId,definitionState,eventTarget,eventSignal,eventAction};
+    private IEnumerable<LineEdit> EditorFormFields()=>new[]{catalogPath,target,property,value,modelKey,definitionId,definitionState,eventTarget,eventSignal,eventAction,parentPath};
     private void ReleaseUnityWorkflow()
     {
-        ReleaseRectInspector();graphEntries.Clear();layoutFields.Clear();inspectorSections.Clear();inspectorContent=null!;anchorDiagram=null!;previewScale=null!;navigationPanel=null!;inspectorPanel=null!;pageGraph=null!;workspaceTabs=null!;inspectorTabs=null!;
+        ReleaseAuthoringPickers();ReleaseRectInspector();graphEntries.Clear();layoutFields.Clear();inspectorSections.Clear();inspectorContent=null!;anchorDiagram=null!;previewScale=null!;navigationPanel=null!;inspectorPanel=null!;pageGraph=null!;workspaceTabs=null!;inspectorTabs=null!;
         placementSource=null!;layoutResponsibility=null!;
         entrySearch=null!;definitionId=null!;definitionState=null!;entryFilter=null!;definitionKind=null!;definitionOrder=null!;
         viewItems=null!;eventBindings=null!;eventTarget=null!;eventSignal=null!;eventAction=null!;definitionSummary=null!;

@@ -10,6 +10,7 @@ namespace MacacaGames.ViewSystem;
 public partial class ViewCatalog:Resource, ISerializationListener
 {
     [Export(PropertyHint.Range,"0,8192,1")] public int ReferenceHeight {get;set;}
+    [Export] public global::Godot.Collections.Array<ViewActionDefinition> Actions {get;set;} = new();
     private global::Godot.Collections.Array<ViewEntry> entries=new();
     private readonly HashSet<Resource> retainedAuthoredResources=new(System.Collections.Generic.ReferenceEqualityComparer.Instance);
     [Export] public global::Godot.Collections.Array<ViewEntry> Entries
@@ -22,6 +23,8 @@ public partial class ViewCatalog:Resource, ISerializationListener
     // instead of depending on native array/cache references to root wrappers.
     public void RetainAuthoredGraph()
     {
+        foreach(var action in Actions)
+            if(action!=null){retainedAuthoredResources.Add(action);if(action.HandlerScript!=null)retainedAuthoredResources.Add(action.HandlerScript);}
         if(SharedPreviewModel!=null)retainedAuthoredResources.Add(SharedPreviewModel);
         foreach(var entry in entries)
         {
@@ -75,6 +78,18 @@ public partial class ViewCatalog:Resource, ISerializationListener
         {
             if(entry==null||string.IsNullOrWhiteSpace(entry.Id)||entry.Scene==null)throw new InvalidOperationException("Every ViewCatalog entry needs an ID and PackedScene.");
             if(!result.TryAdd(entry.Id,entry))throw new InvalidOperationException("Duplicate view ID: "+entry.Id);
+        }
+        if(Actions.Count>0)
+        {
+            var ids=new HashSet<string>(StringComparer.Ordinal);
+            foreach(var action in Actions)
+            {
+                if(action==null||string.IsNullOrWhiteSpace(action.Id)||!ids.Add(action.Id))throw new InvalidOperationException("Action IDs must be nonempty and unique.");
+                if(action.HandlerScript==null||string.IsNullOrWhiteSpace(action.HandlerMethod))throw new InvalidOperationException("Action needs an application handler: "+action.Id);
+                if(Engine.IsEditorHint()&&!action.HasHandlerMethod())throw new InvalidOperationException("Action handler method not found: "+action.Id+" → "+action.HandlerMethod);
+            }
+            foreach(var binding in Entries.SelectMany(e=>e.Events.Concat(e.Elements.SelectMany(p=>p.Events))))
+                if(binding!=null&&!ids.Contains(binding.Action))throw new InvalidOperationException("Undeclared application action: "+binding.Action);
         }
         return result;
     }

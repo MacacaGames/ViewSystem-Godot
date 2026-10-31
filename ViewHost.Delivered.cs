@@ -43,7 +43,11 @@ public partial class ViewHost
     private void BeginLeave(ViewInstance view)
     {
         if (!leaving.Add(view)) return;
-        view.CancelEntry(); view.Lifecycle(p => p.OnBeforeLeave()); view.Lifecycle(p => p.OnStartLeave());
+        view.CancelEntry();
+        var errors = new List<Exception>();
+        try { view.CleanupLifecycle(p => p.OnBeforeLeave()); } catch (Exception error) { errors.Add(error); }
+        try { view.CleanupLifecycle(p => p.OnStartLeave()); } catch (Exception error) { errors.Add(error); }
+        if (errors.Count > 0) throw new AggregateException("Outgoing lifecycle failed.", errors);
     }
     private void ReleaseNestedElements(ViewInstance parent)
     {
@@ -72,13 +76,26 @@ public partial class ViewHost
         owned.Add(view.Root, view);
         view.Root.TreeExiting += () => owned.Remove(view.Root);
         try { Prepared?.Invoke(view); }
-        catch { owned.Remove(view.Root); view.Dispose(); throw; }
+        catch (Exception failure)
+        {
+            owned.Remove(view.Root);var errors=new List<Exception>();
+            try { ReleaseNestedElements(view); } catch(Exception error) { errors.Add(error); }
+            try { view.Dispose(); } catch(Exception error) { errors.Add(error); }
+            if(errors.Count>0)throw new AggregateException("View preparation and cleanup failed.",new[]{failure}.Concat(errors));
+            throw;
+        }
         return view;
     }
     private void RequireImmediate()
     {
+        RequireNoAsyncNavigation();
         if (ShowHooks.Count != 0)
             throw new InvalidOperationException("An asynchronous show hook requires ShowPageAsync/ShowOverlayAsync.");
+    }
+    private void RequireNoAsyncNavigation()
+    {
+        if (gate.CurrentCount == 0)
+            throw new InvalidOperationException("Immediate activation cannot interrupt an asynchronous navigation transaction.");
     }
     public ViewActivation ActivatePage(string id, Action<Control> prepare, double maximumWaitSeconds,
         ViewModels? model = null)
@@ -94,43 +111,76 @@ public partial class ViewHost
         if (!double.IsFinite(maximumWaitSeconds) || maximumWaitSeconds < 0)
             throw new ArgumentOutOfRangeException(nameof(maximumWaitSeconds));
         var entry = Entry(id, ViewKind.Page);
-        var candidate = CreateOwned(entry, preparedContext ?? Context(entry, model));
+        var context = preparedContext ?? Context(entry, model);
+        var staged = new List<ViewInstance>();
+        var newStates = new Dictionary<string, ViewInstance>(StringComparer.Ordinal);
+        var started = new HashSet<ViewInstance>();
+        ViewInstance candidate;
+        double duration;
         try
         {
-            pageLayer.AddChild(candidate.Root);
+            candidate = Mount(entry, context, pageLayer); staged.Add(candidate);
+            foreach (var definition in StateDefinitions(entry))
+                if (StateNeedsCreation(definition.Id))
+                { var state = Mount(definition, context, stateLayer); newStates.Add(definition.Id, state); staged.Add(state); }
             prepare(candidate.Root);
-            candidate.Lifecycle(p => p.OnBeforeShow());
-            candidate.Lifecycle(p => p.OnStartShow());
-            double duration = ProjectTransitions.EnterDuration(candidate.Root);
-            if (!double.IsFinite(duration) || duration < 0) throw new InvalidOperationException("Invalid entry duration.");
-            var previous = CurrentPage;
-            CurrentPage = candidate;
-            foreach (var pair in states.ToArray())
-                if (pair.Value.Definition.State != entry.State) DeactivateState(pair.Key);
-            if (entry.State.Length != 0)
-                foreach (var state in Catalog.Entries.Where(e => e.Kind == ViewKind.State && e.State == entry.State)) ActivateState(state.Id);
-            IsTransitioning = duration > 0;
-            int version = ++activationGeneration;
-            PageReady = FinishDeliveredEntry(candidate, Math.Min(duration, maximumWaitSeconds), version, states.Values.Select(s => s.Ready).ToArray());
-            candidate.Ready = PageReady;
-            ObserveDelivered(PageReady);
-            if (previous != null) ObserveDelivered(RetireDelivered(previous, false));
-            return new(candidate.Root, PageReady);
+            foreach (var state in newStates.Values) { started.Add(state); BeginEntry(state); }
+            started.Add(candidate); BeginEntry(candidate);
+            duration = ProjectTransitions.EnterDuration(candidate.Root); ValidateDuration(duration);
         }
-        catch { if (!ReferenceEquals(CurrentPage, candidate)) candidate.Dispose(); throw; }
+        catch (Exception failure)
+        {
+            var errors = new List<Exception>();
+            foreach (var view in staged.AsEnumerable().Reverse())
+            {
+                if (started.Contains(view))
+                    foreach (var callback in new Action<IViewElementLifeCycle>[] { p => p.OnBeforeLeave(), p => p.OnStartLeave(), p => p.OnHidden() })
+                        try { view.CleanupLifecycle(callback); } catch (Exception error) { errors.Add(error); }
+                try { ReleaseNestedElements(view); } catch (Exception error) { errors.Add(error); }
+                owned.Remove(view.Root);
+                try { view.Dispose(); } catch (Exception error) { errors.Add(error); }
+            }
+            if (errors.Count > 0) throw new AggregateException("Immediate preparation failed and rollback reported errors.", new[] { failure }.Concat(errors));
+            throw;
+        }
+        var previous = CurrentPage;
+        var obsolete = states.Where(p => p.Value.Definition.State != entry.State || newStates.ContainsKey(p.Key)).ToArray();
+        CurrentPage = candidate;
+        foreach (var pair in obsolete) states.Remove(pair.Key);
+        foreach (var pair in newStates) states.Add(pair.Key, pair.Value);
+        IsTransitioning = true;
+        int version = ++activationGeneration;
+        var stateReady = new List<Task>();
+        foreach (var state in states.Values)
+        {
+            if (newStates.ContainsKey(state.Definition.Id))
+            { state.Ready = EnterDeliveredState(state); stateReady.Add(state.Ready); }
+            else
+                try { state.Rebind(context); state.Lifecycle(p => p.RefreshView()); stateReady.Add(state.Ready); }
+                catch (Exception error) { stateReady.Add(Task.FromException(error)); }
+        }
+        PageReady = FinishDeliveredEntry(candidate, Math.Min(duration, maximumWaitSeconds), version, stateReady.ToArray());
+        candidate.Ready = PageReady; ObserveDelivered(PageReady);
+        foreach (var outgoing in obsolete.Select(p => p.Value).Concat(previous == null ? Array.Empty<ViewInstance>() : new[] { previous }))
+            ObserveDelivered(RetireDelivered(outgoing, false));
+        return new(candidate.Root, PageReady);
     }
     private async Task FinishDeliveredEntry(ViewInstance view, double wait, int version, Task[] stateReady)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, view.EntryToken);
-        await view.AnimateAsync(true, linked.Token);
-        if (wait > 0) await ViewController.TweenDelay(view.Root, wait, linked.Token);
-        await Task.WhenAll(stateReady).WaitAsync(linked.Token);
-        linked.Token.ThrowIfCancellationRequested();
-        if (GodotObject.IsInstanceValid(view.Root) && view.Root.IsInsideTree()) view.Lifecycle(p => p.OnShown());
-        if (version == activationGeneration) IsTransitioning = false;
+        try
+        {
+            await view.AnimateAsync(true, linked.Token);
+            if (wait > 0) await ViewController.TweenDelay(view.Root, wait, linked.Token);
+            await Task.WhenAll(stateReady).WaitAsync(linked.Token);
+            linked.Token.ThrowIfCancellationRequested();
+            if (GodotObject.IsInstanceValid(view.Root) && view.Root.IsInsideTree()) view.Lifecycle(p => p.OnShown());
+        }
+        finally { if (version == activationGeneration) IsTransitioning = false; }
     }
     public Control ActivateState(string id)
     {
+        RequireNoAsyncNavigation();
         Initialize();
         var entry = Entry(id, ViewKind.State);
         var context = CurrentPage?.Context ?? Context(entry, null);
@@ -143,16 +193,17 @@ public partial class ViewHost
         var view = CreateOwned(entry, context);
         try
         {
-            stateLayer.AddChild(view.Root); view.Lifecycle(p => p.OnBeforeShow());
+            view.ValidateAnimations(); stateLayer.AddChild(view.Root); view.Lifecycle(p => p.OnBeforeShow());
             view.Lifecycle(p => p.OnStartShow());
             states.Add(id, view); view.Ready = EnterDeliveredState(view); ObserveDelivered(view.Ready); return view.Root;
         }
-        catch { view.Dispose(); throw; }
+        catch { owned.Remove(view.Root); view.Dispose(); throw; }
     }
     public void BringStateForward(string id)
         => stateLayer.MoveChild(states[id].Root, stateLayer.GetChildCount() - 1);
     public void DeactivateState(string id)
     {
+        RequireNoAsyncNavigation();
         if (!states.Remove(id, out var view)) return;
         ObserveDelivered(RetireDelivered(view, false));
     }
@@ -167,22 +218,30 @@ public partial class ViewHost
     private ViewInstance ActivateOverlayCore(string id, ViewModels? model, ViewContext? preparedContext = null)
     {
         Initialize(); var entry = Entry(id, ViewKind.Overlay);
-        var view = CreateOwned(entry, preparedContext ?? Context(entry, model));
+        var view = Mount(entry, preparedContext ?? Context(entry, model), overlayLayer);
         try
         {
-            overlayLayer.AddChild(view.Root); view.Lifecycle(p => p.OnBeforeShow());
-            view.Lifecycle(p => p.OnStartShow()); overlays.Add(view);
-            view.Ready = EnterDeliveredOverlay(view);
+            BeginEntry(view);
+            double wait = ProjectTransitions?.OverlayEnterDuration(view.Root) ?? 0; ValidateDuration(wait);
+            overlays.Add(view); view.Ready = EnterDeliveredOverlay(view, wait);
             ObserveDelivered(view.Ready); return view;
         }
-        catch { view.Dispose(); throw; }
+        catch (Exception failure)
+        {
+            overlays.Remove(view); var errors = new List<Exception>();
+            foreach (var callback in new Action<IViewElementLifeCycle>[] { p => p.OnBeforeLeave(), p => p.OnStartLeave(), p => p.OnHidden() })
+                try { view.CleanupLifecycle(callback); } catch (Exception error) { errors.Add(error); }
+            try { ReleaseNestedElements(view); } catch (Exception error) { errors.Add(error); }
+            owned.Remove(view.Root);
+            try { view.Dispose(); } catch (Exception error) { errors.Add(error); }
+            if (errors.Count > 0) throw new AggregateException("Overlay preparation and cleanup failed.", new[] { failure }.Concat(errors));
+            throw;
+        }
     }
-    private async Task EnterDeliveredOverlay(ViewInstance view)
+    private async Task EnterDeliveredOverlay(ViewInstance view, double wait)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, view.EntryToken);
         await view.AnimateAsync(true, linked.Token);
-        double wait = ProjectTransitions?.OverlayEnterDuration(view.Root) ?? 0;
-        if (!double.IsFinite(wait) || wait < 0) throw new InvalidOperationException("Invalid overlay entry duration.");
         if (wait > 0) await ViewController.TweenDelay(view.Root, wait, linked.Token);
         linked.Token.ThrowIfCancellationRequested(); view.Lifecycle(p => p.OnShown());
     }
@@ -253,44 +312,26 @@ public partial class ViewHost
     public async Task ShutdownAsync()
     {
         lifetime.Cancel();
+        var errors = new List<Exception>();
         try { await DrainTransitionsAsync(); }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
-        // Release registered children before their owning page frees its subtree.
-        static int Depth(Node node) { int depth = 0; while (node.GetParent() is Node parent) { depth++; node = parent; } return depth; }
-        foreach (var view in owned.Values.Where(v => GodotObject.IsInstanceValid(v.Root)).OrderByDescending(v => Depth(v.Root)).ToArray())
-        {
-            if (!GodotObject.IsInstanceValid(view.Root)) continue;
-            view.Lifecycle(p => p.OnBeforeLeave()); view.Lifecycle(p => p.OnStartLeave());
-            view.Root.Hide(); view.Lifecycle(p => p.OnHidden()); view.Dispose();
-        }
-        owned.Clear(); states.Clear(); overlays.Clear(); CurrentPage = null;
-        if (IsInsideTree()) await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
-    }
-    private async Task<ViewInstance> ShowDeliveredAsync(string id, bool overlay, ViewModels? model, CancellationToken token)
-    {
-        Initialize();
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, token);
-        token = linked.Token;
-        var entry = Entry(id, overlay ? ViewKind.Overlay : ViewKind.Page);
-        var request = new ViewPageShowContext(id, overlay, Context(entry, model));
-        await gate.WaitAsync(token);
-        var invoked = new List<IViewPageShowHook>(); bool committed = false;
+        catch (Exception error) { errors.Add(error); }
+        // Let an aborted transaction release its candidates before disposing the host.
+        await gate.WaitAsync();
         try
         {
-            foreach (var hook in ShowHooks) { token.ThrowIfCancellationRequested(); invoked.Add(hook); await hook.BeforePrepareAsync(request, token); }
-            token.ThrowIfCancellationRequested(); ViewInstance result;
-            if (overlay) result = ActivateOverlayCore(id, model, request.Models);
-            else { ActivatePageCore(id, _ => { }, double.MaxValue, model, request.Models); result = CurrentPage!; }
-            committed = true;
-            await result.Ready.WaitAsync(token);
-            foreach (var hook in invoked) { token.ThrowIfCancellationRequested(); await hook.AfterReadyAsync(request, token); }
-            return result;
-        }
-        catch
-        {
-            if (!committed) foreach (var hook in invoked.AsEnumerable().Reverse()) hook.OnAborted(request);
-            throw;
+            static int Depth(Node node) { int depth = 0; while (node.GetParent() is Node parent) { depth++; node = parent; } return depth; }
+            foreach (var view in owned.Values.Where(v => GodotObject.IsInstanceValid(v.Root)).OrderByDescending(v => Depth(v.Root)).ToArray())
+            {
+                if (!owned.ContainsKey(view.Root)) continue;
+                try { BeginLeave(view); } catch (Exception error) { errors.Add(error); }
+                try { view.Root.Hide(); view.CleanupLifecycle(p => p.OnHidden()); } catch (Exception error) { errors.Add(error); }
+                owned.Remove(view.Root); leaving.Remove(view);
+                try { await view.DisposeAsync(); } catch (Exception error) { errors.Add(error); }
+            }
+            owned.Clear(); states.Clear(); overlays.Clear(); CurrentPage = null; IsTransitioning = false;
         }
         finally { gate.Release(); }
+        if (errors.Count > 0) throw new AggregateException("ViewHost shutdown reported cleanup errors.", errors);
     }
 }
