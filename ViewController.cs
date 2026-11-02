@@ -98,9 +98,10 @@ public partial class ViewController:Node
         catch(OperationCanceledException)when(lifetime.IsCancellationRequested){ }
         catch(Exception error){if(TransitionFailed!=null)TransitionFailed(error);else GD.PushError(error.ToString());}
     }
-    public static async Task TweenDelay(Control owner,double seconds,CancellationToken token)
+    public static async Task TweenDelay(Control owner,double seconds,CancellationToken token,bool ignoreTimeScale=false)
     {
-        token.ThrowIfCancellationRequested();var tween=owner.CreateTween();tween.TweenInterval(seconds);
+        if(!double.IsFinite(seconds)||seconds<0)throw new ArgumentOutOfRangeException(nameof(seconds));
+        token.ThrowIfCancellationRequested();var tween=owner.CreateTween().SetIgnoreTimeScale(ignoreTimeScale);if(ignoreTimeScale)tween.SetPauseMode(Tween.TweenPauseMode.Process);tween.TweenInterval(seconds);
         async Task AwaitTween(){await owner.ToSignal(tween,Tween.SignalName.Finished);}
         try{await AwaitTween().WaitAsync(token);}finally{if(tween.IsValid())tween.Kill();}
     }

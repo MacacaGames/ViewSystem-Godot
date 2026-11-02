@@ -20,7 +20,7 @@ public partial class ViewSystemEditor
         layoutResponsibility.Visible=false;
         var top=new HBoxContainer();parent.AddChild(top);
         anchorButton=PresetButton(-1,-1,"AnchorSelector");top.AddChild(anchorButton);
-        anchorButton.TooltipText="Anchor Presets";anchorButton.SizeFlagsVertical=Control.SizeFlags.ShrinkBegin;
+        anchorButton.TooltipText="Anchor Presets · Shift: Pivot · Alt: Position";anchorButton.SizeFlagsVertical=Control.SizeFlags.ShrinkBegin;
         string key=anchorButton.GetInstanceId().ToString();buttonActions.Add(key,()=>anchorPopup.Popup(new Rect2I((Vector2I)anchorButton.GlobalPosition+(Vector2I)anchorButton.GetWindow().Position,(Vector2I)(anchorPresets.GetCombinedMinimumSize()+new Vector2(12,12)))));ConnectUi(anchorButton,BaseButton.SignalName.Pressed,nameof(OnButtonPressed),key);
         var geometry=new GridContainer {Columns=2,SizeFlagsHorizontal=Control.SizeFlags.ExpandFill};top.AddChild(geometry);
         foreach(var name in new[]{"X","Y","W","H"})RectCell(geometry,name,name);
@@ -40,8 +40,8 @@ public partial class ViewSystemEditor
         var rotation=new HBoxContainer();parent.AddChild(rotation);rotation.AddChild(new Label {Text="Rotation",CustomMinimumSize=new Vector2(65,0)});RectCell(rotation,"Degrees","Z");
         var actions=new HBoxContainer();parent.AddChild(actions);
         Button(actions,"Pick","PickRect",()=>Try(PickRect));
-        Button(actions,"Copy","CopyRect",()=>{if(SelectedDefinition() is ViewElementPlacement {LayoutData:{} data}){rectClipboard=data.Duplicate(true);RefreshSmartRect();}});
-        Button(actions,"Paste","PasteRect",()=>{if(rectClipboard!=null && SelectedDefinition() is ViewElementPlacement item)Change(item,"LayoutData",rectClipboard.Duplicate(true),item.LayoutData,"Paste Rect Transform");});
+        Button(actions,"Copy","CopyRect",()=>{if(SelectedLayout() is {Data:{} data}){rectClipboard=data.Duplicate(true);RefreshSmartRect();}});
+        Button(actions,"Paste","PasteRect",()=>{if(rectClipboard!=null && SelectedDefinition() is ViewElementPlacement item)Change(SelectedLayoutOwner()!,"LayoutData",rectClipboard.Duplicate(true),Variant.From(SelectedLayout()?.Data),"Paste Rect Transform");});
         var advanced=new VBoxContainer {Name="RectAdvanced",Visible=false};parent.AddChild(advanced);
         var advancedFold=Button(parent,"Advanced","RectAdvancedToggle",()=>advanced.Visible=!advanced.Visible);parent.MoveChild(advancedFold,advanced.GetIndex());
         RectVector(advanced,"Order","ZOrder","Sibling");
@@ -75,7 +75,7 @@ public partial class ViewSystemEditor
     private void RefreshSmartRect()
     {
         if(rectFields.Count==0)return;syncingRect=true;
-        var l=(SelectedDefinition() as ViewElementPlacement)?.Layout;
+        var l=SelectedLayout();
         foreach(var field in rectFields.Values)field.Editable=l!=null;
         anchorButton.Disabled=l==null;
         var control=SelectedControl();bool container=control?.GetParent() is Container;
@@ -93,7 +93,7 @@ public partial class ViewSystemEditor
                 ["Y"]=sy?l.OffsetTop:-(l.OffsetTop+(l.OffsetBottom-l.OffsetTop)*p.Y),
                 ["W"]=sx?-l.OffsetRight:l.OffsetRight-l.OffsetLeft,["H"]=sy?-l.OffsetBottom:l.OffsetBottom-l.OffsetTop,
                 ["MinX"]=l.AnchorLeft,["MinY"]=1-l.AnchorBottom,["MaxX"]=l.AnchorRight,["MaxY"]=1-l.AnchorTop,
-                ["PivotU"]=p.X,["PivotV"]=1-p.Y,["ScaleU"]=l.Scale.X,["ScaleV"]=l.Scale.Y,["Degrees"]=Mathf.RadToDeg(l.Rotation),["ZOrder"]=l.SortOrder,["Sibling"]=((ViewElementPlacement)SelectedDefinition()!).SiblingIndex};
+                ["PivotU"]=p.X,["PivotV"]=1-p.Y,["ScaleU"]=l.Scale.X,["ScaleV"]=l.Scale.Y,["Degrees"]=-Mathf.RadToDeg(l.Rotation),["ZOrder"]=l.SortOrder,["Sibling"]=((ViewElementPlacement)SelectedDefinition()!).SiblingIndex};
             foreach(var value in values)rectFields[value.Key].SetValueNoSignal(value.Value);
             foreach(var button in anchorPresets.GetChildren().OfType<Button>())
             {
@@ -102,11 +102,11 @@ public partial class ViewSystemEditor
             }
             anchorButton.Call("show_anchors",new Vector2(l.AnchorLeft,l.AnchorTop),new Vector2(l.AnchorRight,l.AnchorBottom));
         }
-        syncingRect=false;
+        syncingRect=false;RefreshParityInspector();
     }
     private void OnRectEdited(double value,string key)
     {
-        if(syncingRect||HasMeta(ReloadState)||SelectedDefinition() is not ViewElementPlacement {Layout:{} l})return;
+        if(syncingRect||HasMeta(ReloadState)||SelectedDefinition() is not ViewElementPlacement || SelectedLayout() is not {} l)return;
         var p=RectPivot(l);bool sx=l.AnchorLeft!=l.AnchorRight,sy=l.AnchorTop!=l.AnchorBottom;
         syncingLayout=true;
         if(!l.UseNormalizedPivot){rectNormalizePending=true;layoutFields["PivotX"].SetValueNoSignal(p.X);layoutFields["PivotY"].SetValueNoSignal(p.Y);}
@@ -121,7 +121,7 @@ public partial class ViewSystemEditor
         if(key=="PivotU")Set("PivotX",rectNormalizePending||l.UseNormalizedPivot?value:value*size.X);
         if(key=="PivotV")Set("PivotY",rectNormalizePending||l.UseNormalizedPivot?1-value:(1-value)*size.Y);
         if(key=="ScaleU")Set("ScaleX",value);if(key=="ScaleV")Set("ScaleY",value);
-        if(key=="Degrees")Set("Rotation",Mathf.DegToRad((float)value));if(key=="ZOrder")Set("SortOrder",value);if(key=="Sibling")Set("SiblingIndex",value);
+        if(key=="Degrees")Set("Rotation",-Mathf.DegToRad((float)value));if(key=="ZOrder")Set("SortOrder",value);if(key=="Sibling")Set("SiblingIndex",value);
         syncingLayout=false;try{Try(ApplyPlacementLayout);}finally{rectNormalizePending=false;}
     }
     private void PickRect()
@@ -129,7 +129,7 @@ public partial class ViewSystemEditor
         if(SelectedDefinition() is not ViewElementPlacement item || SelectedControl() is not {} c)return;
         if(c.GetParent() is Container)throw new InvalidOperationException("Parent Container owns layout.");
         var l=new ViewElementLayout(new Resource()){AnchorLeft=c.AnchorLeft,AnchorTop=c.AnchorTop,AnchorRight=c.AnchorRight,AnchorBottom=c.AnchorBottom,OffsetLeft=c.OffsetLeft,OffsetTop=c.OffsetTop,OffsetRight=c.OffsetRight,OffsetBottom=c.OffsetBottom,PivotOffset=c.PivotOffset,Scale=c.Scale,Rotation=c.Rotation,SortOrder=c.ZIndex};
-        Change(item,"LayoutData",l.Data,item.LayoutData,"Pick Rect Transform");
+        Change(SelectedLayoutOwner()!,"LayoutData",l.Data,Variant.From(SelectedLayout()?.Data),"Pick Rect Transform");
     }
     private void ReleaseRectInspector(){rectFields.Clear();rectLabels.Clear();anchorPopup=null!;anchorPresets=null!;anchorButton=null!;}
 }

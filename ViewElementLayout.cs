@@ -9,6 +9,13 @@ namespace MacacaGames.ViewSystem;
 
 /// <summary>Typed access to a native Resource metadata schema. The carrier has
 /// no C# script instance, so its Inspector/serialization survives assembly reload.</summary>
+[Flags]
+public enum ViewLayoutFlags
+{
+    None=0, SizeDelta=1, AnchoredPosition=2, AnchorMax=4, AnchorMin=8,
+    LocalEulerAngles=16, LocalScale=32, Pivot=64, SortOrder=128, All=255
+}
+
 public sealed class ViewElementLayout
 {
     public Resource Data { get; }
@@ -34,6 +41,11 @@ public sealed class ViewElementLayout
         if(!Data.HasMeta("SortOrder"))Data.SetMeta("SortOrder",0);
     }
     public Variant Get(string name)=>Data.GetMeta(name);
+    public ViewLayoutFlags Flags { get=>Data.HasMeta("Flags")?(ViewLayoutFlags)Data.GetMeta("Flags").AsInt32():ViewLayoutFlags.All; set=>Data.SetMeta("Flags",(int)value); }
+    public static ViewElementLayout Capture(Control node) => new(new Resource())
+    { AnchorLeft=node.AnchorLeft, AnchorTop=node.AnchorTop, AnchorRight=node.AnchorRight, AnchorBottom=node.AnchorBottom,
+      OffsetLeft=node.OffsetLeft, OffsetTop=node.OffsetTop, OffsetRight=node.OffsetRight, OffsetBottom=node.OffsetBottom,
+      PivotOffset=node.PivotOffset, Scale=node.Scale, Rotation=node.Rotation, SortOrder=node.ZIndex };
     public float AnchorLeft { get=>Data.GetMeta("AnchorLeft").AsSingle(); set=>Data.SetMeta("AnchorLeft",value); }
     public float AnchorTop { get=>Data.GetMeta("AnchorTop").AsSingle(); set=>Data.SetMeta("AnchorTop",value); }
     public float AnchorRight { get=>Data.GetMeta("AnchorRight").AsSingle(); set=>Data.SetMeta("AnchorRight",value); }
@@ -55,9 +67,21 @@ public sealed class ViewElementLayout
         if (SortOrder < RenderingServer.CanvasItemZMin || SortOrder > RenderingServer.CanvasItemZMax)
             throw new InvalidOperationException("Placement SortOrder is outside Godot's CanvasItem ZIndex range.");
         if (node.GetParent() is Container) throw new InvalidOperationException("A Container owns this placement's geometry; remove its explicit Layout.");
-        node.AnchorLeft=AnchorLeft;node.AnchorTop=AnchorTop;node.AnchorRight=AnchorRight;node.AnchorBottom=AnchorBottom;
-        node.OffsetLeft=OffsetLeft;node.OffsetTop=OffsetTop;node.OffsetRight=OffsetRight;node.OffsetBottom=OffsetBottom;
-        ApplyPivot(node);node.Scale=Scale;node.Rotation=Rotation;node.ZIndex=SortOrder;
+        bool Has(ViewLayoutFlags flag) => (Flags & flag) != 0;
+        var oldPivot = new Vector2(node.Size.X == 0 ? 0 : node.PivotOffset.X/node.Size.X, node.Size.Y == 0 ? 0 : node.PivotOffset.Y/node.Size.Y);
+        var sourceSize = new Vector2(OffsetRight-OffsetLeft,OffsetBottom-OffsetTop);
+        var sourcePivot = UseNormalizedPivot ? NormalizedPivot : new Vector2(node.Size.X == 0 ? 0 : PivotOffset.X/node.Size.X,node.Size.Y == 0 ? 0 : PivotOffset.Y/node.Size.Y);
+        var delta = Has(ViewLayoutFlags.SizeDelta) ? sourceSize : new Vector2(node.OffsetRight-node.OffsetLeft,node.OffsetBottom-node.OffsetTop);
+        var position = Has(ViewLayoutFlags.AnchoredPosition) ? new Vector2(OffsetLeft,OffsetTop)+sourceSize*sourcePivot : new Vector2(node.OffsetLeft,node.OffsetTop)+new Vector2(node.OffsetRight-node.OffsetLeft,node.OffsetBottom-node.OffsetTop)*oldPivot;
+        var pivot = Has(ViewLayoutFlags.Pivot) ? sourcePivot : oldPivot;
+        if(Has(ViewLayoutFlags.AnchorMin)){node.AnchorLeft=AnchorLeft;node.AnchorBottom=AnchorBottom;}
+        if(Has(ViewLayoutFlags.AnchorMax)){node.AnchorRight=AnchorRight;node.AnchorTop=AnchorTop;}
+        if(Has(ViewLayoutFlags.SizeDelta)||Has(ViewLayoutFlags.AnchoredPosition)||Has(ViewLayoutFlags.Pivot))
+        { var a=position-delta*pivot;var b=a+delta;node.OffsetLeft=a.X;node.OffsetTop=a.Y;node.OffsetRight=b.X;node.OffsetBottom=b.Y; }
+        ApplyPivot(node);
+        if(Has(ViewLayoutFlags.LocalScale))node.Scale=Scale;
+        if(Has(ViewLayoutFlags.LocalEulerAngles))node.Rotation=Rotation;
+        if(Has(ViewLayoutFlags.SortOrder))node.ZIndex=SortOrder;
     }
-    public void ApplyPivot(Control node) => node.PivotOffset=UseNormalizedPivot ? node.Size*NormalizedPivot : PivotOffset;
+    public void ApplyPivot(Control node) { if((Flags & ViewLayoutFlags.Pivot)!=0)node.PivotOffset=UseNormalizedPivot ? node.Size*NormalizedPivot : PivotOffset; }
 }

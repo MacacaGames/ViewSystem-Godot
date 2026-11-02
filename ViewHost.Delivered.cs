@@ -34,25 +34,27 @@ public partial class ViewHost
         CurrentPage.Rebind(Context(CurrentPage.Definition, model));
         CurrentPage.Lifecycle(p => p.RefreshView());
         foreach (var state in states.Values)
-        { state.Rebind(CurrentPage.Context); state.Lifecycle(p => p.RefreshView()); }
+        { state.Rebind(ContextForState(state)); state.Lifecycle(p => p.RefreshView()); }
     }
-    public int OwnedInstanceCount => owned.Count;
+    public int OwnedInstanceCount => owned.Count+requestedViews.Count;
     private readonly Dictionary<Control, ViewInstance> owned = new();
     private readonly HashSet<Task> retiring = new();
     private readonly HashSet<ViewInstance> leaving = new();
     private void BeginLeave(ViewInstance view)
     {
         if (!leaving.Add(view)) return;
+        elementPool?.MarkPending(view,true);
         view.CancelEntry();
         var errors = new List<Exception>();
-        try { view.CleanupLifecycle(p => p.OnBeforeLeave()); } catch (Exception error) { errors.Add(error); }
+        try { view.CleanupLifecycle(p=>p.OnChangePage(false));view.CleanupLifecycle(p => p.OnBeforeLeave()); } catch (Exception error) { errors.Add(error); }
         try { view.CleanupLifecycle(p => p.OnStartLeave()); } catch (Exception error) { errors.Add(error); }
         if (errors.Count > 0) throw new AggregateException("Outgoing lifecycle failed.", errors);
     }
-    private void ReleaseNestedElements(ViewInstance parent)
+    private void ReleaseNestedElements(ViewInstance parent)=>ReleaseDescendants(parent.Root,false);
+    private void ReleaseDescendants(Control parent,bool permanentPool)
     {
         var errors = new List<Exception>();
-        foreach (var child in owned.Values.Where(v => v != parent && GodotObject.IsInstanceValid(v.Root) && parent.Root.IsAncestorOf(v.Root)).ToArray())
+        foreach (var child in owned.Values.Where(v => v.Root != parent && GodotObject.IsInstanceValid(v.Root) && GodotObject.IsInstanceValid(parent) && parent.IsAncestorOf(v.Root)&&(permanentPool||elementPool?.HasPooledAncestor(v.Root)!=true)).ToArray())
         {
             if (!owned.ContainsKey(child.Root)) continue;
             try { ReleaseElement(child.Root); } catch (Exception error) { errors.Add(error); }
@@ -62,7 +64,7 @@ public partial class ViewHost
     private int activationGeneration;
     private Control? logicalCanvas;
     public override void _Notification(int what)
-    { if (what == NotificationResized && logicalCanvas != null) FitLogicalCanvas(); }
+    { if (what == NotificationResized) {if(logicalCanvas != null) FitLogicalCanvas();RefreshSafeArea();} }
     private void FitLogicalCanvas()
     {
         if (logicalCanvas == null || Size.X <= 0 || Size.Y <= 0 || Catalog.ReferenceHeight <= 0) return;
@@ -70,11 +72,11 @@ public partial class ViewHost
         logicalCanvas.Scale = Vector2.One * (Size.Y / Catalog.ReferenceHeight);
     }
 
-    private ViewInstance CreateOwned(ViewEntry entry, ViewContext context)
+    private ViewInstance CreateOwned(ViewEntry entry, ViewContext context,IReadOnlyDictionary<string,PackedScene>? scenes=null)
     {
-        var view = ViewComposer.Create(entry, context);
+        var view = ViewComposer.Create(entry, context, elementPool,scenes);
         owned.Add(view.Root, view);
-        view.Root.TreeExiting += () => owned.Remove(view.Root);
+        view.Root.TreeExiting += () => {if(elementPool?.HasPooledAncestor(view.Root)!=true)owned.Remove(view.Root);};
         try { Prepared?.Invoke(view); }
         catch (Exception failure)
         {
@@ -119,10 +121,10 @@ public partial class ViewHost
         double duration;
         try
         {
-            candidate = Mount(entry, context, pageLayer); staged.Add(candidate);
             foreach (var definition in StateDefinitions(entry))
                 if (StateNeedsCreation(definition.Id))
                 { var state = Mount(definition, context, stateLayer); newStates.Add(definition.Id, state); staged.Add(state); }
+            candidate = Mount(entry, context, pageLayer); staged.Add(candidate);
             prepare(candidate.Root);
             foreach (var state in newStates.Values) { started.Add(state); BeginEntry(state); }
             started.Add(candidate); BeginEntry(candidate);
@@ -144,7 +146,7 @@ public partial class ViewHost
             throw;
         }
         var previous = CurrentPage;
-        var obsolete = states.Where(p => p.Value.Definition.State != entry.State || newStates.ContainsKey(p.Key)).ToArray();
+        var obsolete = states.Where(p => !StateGroupRequired(p.Value.Definition.State,entry) || newStates.ContainsKey(p.Key)).ToArray();
         CurrentPage = candidate;
         foreach (var pair in obsolete) states.Remove(pair.Key);
         foreach (var pair in newStates) states.Add(pair.Key, pair.Value);
@@ -156,9 +158,10 @@ public partial class ViewHost
             if (newStates.ContainsKey(state.Definition.Id))
             { state.Ready = EnterDeliveredState(state); stateReady.Add(state.Ready); }
             else
-                try { state.Rebind(context); state.Lifecycle(p => p.RefreshView()); stateReady.Add(state.Ready); }
+                try { state.Rebind(ContextForState(state)); state.Lifecycle(p => p.RefreshView()); stateReady.Add(state.Ready); }
                 catch (Exception error) { stateReady.Add(Task.FromException(error)); }
         }
+        CommitPresentation(candidate);
         PageReady = FinishDeliveredEntry(candidate, Math.Min(duration, maximumWaitSeconds), version, stateReady.ToArray());
         candidate.Ready = PageReady; ObserveDelivered(PageReady);
         foreach (var outgoing in obsolete.Select(p => p.Value).Concat(previous == null ? Array.Empty<ViewInstance>() : new[] { previous }))
@@ -174,7 +177,7 @@ public partial class ViewHost
             if (wait > 0) await ViewController.TweenDelay(view.Root, wait, linked.Token);
             await Task.WhenAll(stateReady).WaitAsync(linked.Token);
             linked.Token.ThrowIfCancellationRequested();
-            if (GodotObject.IsInstanceValid(view.Root) && view.Root.IsInsideTree()) view.Lifecycle(p => p.OnShown());
+            if (GodotObject.IsInstanceValid(view.Root) && view.Root.IsInsideTree()) view.Lifecycle(p => {p.OnShown();p.OnChangedPage();});
         }
         finally { if (version == activationGeneration) IsTransitioning = false; }
     }
@@ -211,24 +214,33 @@ public partial class ViewHost
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, view.EntryToken);
         await view.AnimateAsync(true, linked.Token);
-        linked.Token.ThrowIfCancellationRequested(); view.Lifecycle(p => p.OnShown());
+        linked.Token.ThrowIfCancellationRequested(); view.Lifecycle(p => {p.OnShown();p.OnChangedPage();});
     }
     public ViewInstance ActivateOverlay(string id, ViewModels? model = null)
     { RequireImmediate(); return ActivateOverlayCore(id, model); }
     private ViewInstance ActivateOverlayCore(string id, ViewModels? model, ViewContext? preparedContext = null)
     {
         Initialize(); var entry = Entry(id, ViewKind.Overlay);
-        var view = Mount(entry, preparedContext ?? Context(entry, model), overlayLayer);
+        var context=preparedContext??Context(entry,model);
+        var priorFocus=GetViewport().GuiGetFocusOwner();
+        var newStates=new Dictionary<string,ViewInstance>(StringComparer.Ordinal);
+        var view = Mount(entry, context, overlayLayer);
         try
         {
+            foreach(var definition in StateDefinitions(entry))if(StateNeedsCreation(definition.Id))
+            {var state=Mount(definition,context,stateLayer);newStates.Add(definition.Id,state);BeginEntry(state);}
             BeginEntry(view);
             double wait = ProjectTransitions?.OverlayEnterDuration(view.Root) ?? 0; ValidateDuration(wait);
-            overlays.Add(view); view.Ready = EnterDeliveredOverlay(view, wait);
+            overlays.Add(view);
+            foreach(var pair in newStates){states[pair.Key]=pair.Value;pair.Value.Ready=EnterDeliveredState(pair.Value);ObserveDelivered(pair.Value.Ready);}
+            CommitPresentation(view,priorFocus); view.Ready = Task.WhenAll(newStates.Values.Select(v=>v.Ready).Append(EnterDeliveredOverlay(view, wait)));
             ObserveDelivered(view.Ready); return view;
         }
         catch (Exception failure)
         {
             overlays.Remove(view); var errors = new List<Exception>();
+            foreach(var pair in newStates)
+            {states.Remove(pair.Key);owned.Remove(pair.Value.Root);try{pair.Value.Dispose();}catch(Exception error){errors.Add(error);}}
             foreach (var callback in new Action<IViewElementLifeCycle>[] { p => p.OnBeforeLeave(), p => p.OnStartLeave(), p => p.OnHidden() })
                 try { view.CleanupLifecycle(callback); } catch (Exception error) { errors.Add(error); }
             try { ReleaseNestedElements(view); } catch (Exception error) { errors.Add(error); }
@@ -243,14 +255,16 @@ public partial class ViewHost
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, view.EntryToken);
         await view.AnimateAsync(true, linked.Token);
         if (wait > 0) await ViewController.TweenDelay(view.Root, wait, linked.Token);
-        linked.Token.ThrowIfCancellationRequested(); view.Lifecycle(p => p.OnShown());
+        linked.Token.ThrowIfCancellationRequested(); view.Lifecycle(p => {p.OnShown();p.OnChangedPage();});
     }
     public Task DismissDeliveredOverlayAsync(Control root)
     {
         if (!owned.TryGetValue(root, out var view) || !overlays.Remove(view))
             throw new InvalidOperationException("Overlay does not belong to this host.");
-        var operation = RetireDelivered(view, true); ObserveDelivered(operation); return operation;
+        var operation = DismissImmediateOverlay(view); ObserveDelivered(operation); return operation;
     }
+    private async Task DismissImmediateOverlay(ViewInstance view)
+    {await RetireDelivered(view,true);await ReconcileStatesAsync();RestoreFocus(view);}
     private async Task RetireDelivered(ViewInstance view, bool overlay)
     {
         var errors = new List<Exception>();
@@ -259,23 +273,23 @@ public partial class ViewHost
         {
             BeginLeave(view);
             await view.AnimateAsync(false, lifetime.Token);
-            if (ProjectTransitions != null && view.Definition.Kind != ViewKind.State)
+            if (!view.SkipTransitions && ProjectTransitions != null && view.Definition.Kind != ViewKind.State)
             {
                 if (overlay) await ProjectTransitions.RetireOverlayAsync(view.Root, lifetime.Token);
                 else await ProjectTransitions.RetirePageAsync(view.Root, lifetime.Token);
             }
-            view.Root.Hide(); hidden = true; view.Lifecycle(p => p.OnHidden());
+            view.Root.Hide(); hidden = true; view.Lifecycle(p => {p.OnHidden();p.OnChangedPage();});
         }
         catch (Exception error) { errors.Add(error); }
         // Cancellation shortens animation, not the leave lifecycle. Cleanup
         // errors remain visible without masking the original transition error.
         if (!hidden)
         {
-            try { view.Root.Hide(); view.Lifecycle(p => p.OnHidden()); }
+            try { view.Root.Hide(); view.Lifecycle(p => {p.OnHidden();p.OnChangedPage();}); }
             catch (Exception error) { errors.Add(error); }
         }
         try { ReleaseNestedElements(view); } catch (Exception error) { errors.Add(error); }
-        leaving.Remove(view); owned.Remove(view.Root);
+        leaving.Remove(view); owned.Remove(view.Root);ReleasePresentation(view);
         try { await view.DisposeAsync(); } catch (Exception error) { errors.Add(error); }
         if (errors.Count == 1) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(errors[0]).Throw();
         if (errors.Count > 1) throw new AggregateException("View retirement and cleanup failed.", errors);
@@ -286,7 +300,7 @@ public partial class ViewHost
         if (entry.ShowAnimation.Length != 0 || entry.HideAnimation.Length != 0)
             throw new InvalidOperationException("Detached synchronous elements cannot own asynchronous animations.");
         var view = CreateOwned(entry, Context(entry, model));
-        view.Root.Ready += () => { view.Lifecycle(p => p.OnBeforeShow()); view.Lifecycle(p => p.OnStartShow()); view.Lifecycle(p => p.OnShown()); };
+        view.Root.Ready += () => { view.HasEntered=true;view.Lifecycle(p => p.OnBeforeShow()); view.Lifecycle(p => p.OnStartShow()); view.Lifecycle(p => {p.OnShown();p.OnChangedPage();}); };
         return view.Root;
     }
     public void ReleaseElement(Control root)
@@ -295,7 +309,7 @@ public partial class ViewHost
         try
         {
             BeginLeave(view); ReleaseNestedElements(view);
-            root.Hide(); view.Lifecycle(p => p.OnHidden());
+            root.Hide(); view.Lifecycle(p => {p.OnHidden();p.OnChangedPage();});
         }
         finally { leaving.Remove(view); view.Dispose(); }
     }
@@ -311,8 +325,8 @@ public partial class ViewHost
     public async Task DrainTransitionsAsync() => await Task.WhenAll(retiring.ToArray());
     public async Task ShutdownAsync()
     {
-        lifetime.Cancel();
         var errors = new List<Exception>();
+        try{lifetime.Cancel();}catch(Exception error){errors.Add(error);}
         try { await DrainTransitionsAsync(); }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
         catch (Exception error) { errors.Add(error); }
@@ -320,6 +334,7 @@ public partial class ViewHost
         await gate.WaitAsync();
         try
         {
+            foreach(var pool in requestedPools.ToArray())try{pool.Dispose();}catch(Exception error){errors.Add(error);}
             static int Depth(Node node) { int depth = 0; while (node.GetParent() is Node parent) { depth++; node = parent; } return depth; }
             foreach (var view in owned.Values.Where(v => GodotObject.IsInstanceValid(v.Root)).OrderByDescending(v => Depth(v.Root)).ToArray())
             {
@@ -329,7 +344,10 @@ public partial class ViewHost
                 owned.Remove(view.Root); leaving.Remove(view);
                 try { await view.DisposeAsync(); } catch (Exception error) { errors.Add(error); }
             }
+            ReleaseFrameRate();
             owned.Clear(); states.Clear(); overlays.Clear(); CurrentPage = null; IsTransitioning = false;
+            foreach(var barrier in modalBarriers.Values)if(GodotObject.IsInstanceValid(barrier))barrier.QueueFree();modalBarriers.Clear();previousFocus.Clear();suspendedFocus.Clear();
+            try{elementPool?.Dispose();}catch(Exception error){errors.Add(error);}
         }
         finally { gate.Release(); }
         if (errors.Count > 0) throw new AggregateException("ViewHost shutdown reported cleanup errors.", errors);

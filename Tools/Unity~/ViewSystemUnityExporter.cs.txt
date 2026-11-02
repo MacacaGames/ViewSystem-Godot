@@ -1,0 +1,160 @@
+// Copy into Assets/Editor in the source Unity project. No package dependencies.
+#if UNITY_EDITOR
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using System.Text;
+using System.Globalization;
+using System.Collections;
+using System.Reflection;
+namespace MacacaGames.ViewSystemMigration
+{
+    public static class ViewSystemUnityExporter
+    {
+        [Serializable] public class Manifest {public int schema=1;public string unityVersion;public float sampleRate=60;public List<Asset> assets=new();public List<string> issues=new();}
+        [Serializable] public class Ref {public string guid="";public long fileId;}
+        [Serializable] public class Property {public string path,type,text;public double number;public long integer;public bool boolean;public float[] vector;public Ref reference;}
+        [Serializable] public class Component {public string type,json;public List<Property> properties=new();}
+        [Serializable] public class Tree {public string name;public bool active;public bool ui;public float[] position,rotation,scale,anchors,offsets,pivot;public List<Component> components=new();public List<Tree> children=new();}
+        [Serializable] public class Key {public float time,value,inTangent,outTangent,inWeight,outWeight;public int weightedMode;}
+        [Serializable] public class Sample {public float time,value;public Ref reference;}
+        [Serializable] public class Curve {public string path,type,property;public List<Key> keys=new();public List<Sample> samples=new();public bool discrete;public int preWrap,postWrap;}
+        [Serializable] public class Event {public float time,floatParameter;public int intParameter;public string function,stringParameter;public Ref objectParameter;}
+        [Serializable] public class Parameter {public string name,type;public float number;public bool boolean;}
+        [Serializable] public class Condition {public string parameter,mode;public float threshold;}
+        [Serializable] public class Transition {public string from,to,interruption;public float duration,offset,exitTime;public bool fixedDuration,hasExitTime,canTransitionToSelf,orderedInterruption,isExit;public List<Condition> conditions=new();}
+        [Serializable] public class State {public string id,machine,name;public Ref motion;public string motionType,speedParameter,timeParameter,mirrorParameter,cycleOffsetParameter;public float speed,cycleOffset;public bool mirror,writeDefaultValues;public List<string> behaviours=new();}
+        [Serializable] public class Layer {public string name,defaultState,blend;public float weight;public Ref mask;public int syncedLayer;public List<State> states=new();public List<Transition> transitions=new();public List<string> machines=new();}
+        [Serializable] public class Asset {public string guid,path,type,kind,name,json,file,sha256;public long fileId;public List<string> dependencies=new();public Tree root;public List<Curve> curves=new();public List<Event> events=new();public float length,frameRate;public bool loop;public List<Parameter> parameters=new();public List<Layer> layers=new();public Ref reference;public float[] rect;public List<Property> properties=new();}
+        static Manifest manifest;static string destination;
+        static string Arg(string name,string fallback){var args=Environment.GetCommandLineArgs();int i=Array.IndexOf(args,name);return i>=0&&i+1<args.Length?args[i+1]:fallback;}
+        static Ref Reference(UnityEngine.Object value){if(value==null)return new Ref();AssetDatabase.TryGetGUIDAndLocalFileIdentifier(value,out string guid,out long id);return new Ref{guid=guid??"",fileId=id};}
+        static float[] V(Vector3 v)=>new[]{v.x,v.y,v.z};
+        [MenuItem("Tools/ViewSystem/Export Unity assets")]
+        public static void ExportSelected(){string folder=EditorUtility.SaveFolderPanel("Unity → Godot bundle","","");if(folder.Length==0)return;ExportPaths(Selection.assetGUIDs.Select(AssetDatabase.GUIDToAssetPath),folder,60);}
+        public static void Export(){string root=Arg("-viewExportRoot","Assets");string output=Arg("-viewExportOutput","");if(output.Length==0)throw new ArgumentException("-viewExportOutput is required");ExportPaths(new[]{root},output,float.Parse(Arg("-viewSampleRate","60"),System.Globalization.CultureInfo.InvariantCulture));}
+        public static void ExportPaths(IEnumerable<string> paths,string output,float sampleRate)
+        {
+            if(!float.IsFinite(sampleRate)||sampleRate<1||sampleRate>240)throw new ArgumentException("Sample rate must be 1..240");
+            destination=Path.GetFullPath(output);if(Directory.Exists(destination)&&Directory.EnumerateFileSystemEntries(destination).Any())throw new IOException("Export destination must be empty");Directory.CreateDirectory(destination);Directory.CreateDirectory(Path.Combine(destination,"files"));
+            manifest=new Manifest{unityVersion=Application.unityVersion,sampleRate=sampleRate};
+            var selected=paths.SelectMany(p=>AssetDatabase.IsValidFolder(p)?AssetDatabase.FindAssets("",new[]{p}).Select(AssetDatabase.GUIDToAssetPath):new[]{p}).Where(p=>!AssetDatabase.IsValidFolder(p)).ToArray();
+            foreach(string path in AssetDatabase.GetDependencies(selected,true).OrderBy(p=>p,StringComparer.Ordinal))
+            {
+                if(!File.Exists(path))continue;
+                string file="files/"+AssetDatabase.AssetPathToGUID(path)+Path.GetExtension(path)+(Path.GetExtension(path)==".cs"?".txt":"");File.Copy(path,Path.Combine(destination,file),true);
+                using var stream=File.OpenRead(path);using var hash=SHA256.Create();string sha=BitConverter.ToString(hash.ComputeHash(stream)).Replace("-","").ToLowerInvariant();
+                var objects=AssetDatabase.LoadAllAssetsAtPath(path);if(objects.Length==0)objects=new[]{AssetDatabase.LoadMainAssetAtPath(path)};
+                if(!objects.Any(o=>o!=null))manifest.issues.Add(path+": asset cannot be loaded; check missing scripts/import errors");
+                foreach(var obj in objects.Where(o=>o!=null))
+                {
+                    var r=Reference(obj);var a=new Asset{guid=r.guid,fileId=r.fileId,path=path,name=obj.name,type=obj.GetType().FullName,file=file,sha256=sha,kind="Source",dependencies=AssetDatabase.GetDependencies(path,false).OrderBy(p=>p,StringComparer.Ordinal).ToList()};
+                    try
+                    {
+                        a.json=EditorJsonUtility.ToJson(obj);
+                        if(obj is AnimationClip clip){a.kind="Animation";ExportClip(clip,a);}
+                        else if(obj is AnimatorController controller){a.kind="Animator";ExportController(controller,a);}
+                        else if(obj is GameObject go){a.kind=go.transform.parent==null?"Prefab":"Embedded";if(a.kind=="Prefab")a.root=ExportTree(go);}
+                        else if(obj is SceneAsset){a.kind="Scene";var scene=EditorSceneManager.OpenPreviewScene(path);try{a.root=new Tree{name=obj.name,active=true,ui=true};foreach(var node in scene.GetRootGameObjects())a.root.children.Add(ExportTree(node));}finally{EditorSceneManager.ClosePreviewScene(scene);}}
+                        else if(obj is Sprite sprite){a.kind="Sprite";a.reference=Reference(sprite.texture);var rect=sprite.rect;a.rect=new[]{rect.x,rect.y,rect.width,rect.height,sprite.texture.height};}
+                        else if(obj is Texture2D||obj is AudioClip||obj is Font)a.kind="File";
+                        else if(obj is ScriptableObject){a.kind="Resource";a.properties=ExportProperties(obj);}
+                        else if(obj is UnityEngine.Component||obj is AnimatorState||obj is AnimatorStateMachine||obj is AnimatorTransitionBase)a.kind="Embedded";
+                        else if(obj is MonoScript)a.kind="Script";
+                    }catch(Exception error){manifest.issues.Add(path+"/"+obj.name+": "+error.Message);}
+                    manifest.assets.Add(a);
+                }
+            }
+            File.WriteAllText(Path.Combine(destination,"manifest.json"),WriteJson(manifest));Debug.Log("ViewSystem exported "+manifest.assets.Count+" assets to "+destination);
+        }
+        static string WriteJson(object data)
+        {
+            var json=new StringBuilder();
+            void Write(object value)
+            {
+                if(value==null){json.Append("null");return;}
+                if(value is string text){json.Append('"');foreach(char c in text){switch(c){case '"':json.Append("\\\"");break;case '\\':json.Append("\\\\");break;case '\n':json.Append("\\n");break;case '\r':json.Append("\\r");break;case '\t':json.Append("\\t");break;default:if(c<32)json.Append("\\u"+((int)c).ToString("x4"));else json.Append(c);break;}}json.Append('"');return;}
+                if(value is bool flag){json.Append(flag?"true":"false");return;}
+                if(value is IFormattable number&&value.GetType().IsPrimitive){json.Append(number.ToString(null,CultureInfo.InvariantCulture));return;}
+                if(value is IEnumerable sequence){json.Append('[');bool first=true;foreach(var item in sequence){if(!first)json.Append(',');first=false;Write(item);}json.Append(']');return;}
+                json.Append('{');bool initial=true;foreach(var field in value.GetType().GetFields(BindingFlags.Instance|BindingFlags.Public)){if(!initial)json.Append(',');initial=false;Write(field.Name);json.Append(':');Write(field.GetValue(value));}json.Append('}');
+            }
+            Write(data);return json.ToString();
+        }
+        static Tree ExportTree(GameObject go)
+        {
+            var t=go.transform;var result=new Tree{name=go.name,active=go.activeSelf,ui=t is RectTransform,position=V(t.localPosition),rotation=V(t.localEulerAngles),scale=V(t.localScale)};
+            if(t is RectTransform r){result.anchors=new[]{r.anchorMin.x,1-r.anchorMax.y,r.anchorMax.x,1-r.anchorMin.y};result.offsets=new[]{r.offsetMin.x,-r.offsetMax.y,r.offsetMax.x,-r.offsetMin.y};result.pivot=new[]{r.pivot.x,1-r.pivot.y};}
+            foreach(var component in go.GetComponents<UnityEngine.Component>())
+            {
+                if(component==null){manifest.issues.Add(go.name+": Missing script");continue;}
+                var c=new Component{type=component.GetType().FullName,json=EditorJsonUtility.ToJson(component)};c.properties=ExportProperties(component);
+                result.components.Add(c);
+            }
+            foreach(Transform child in t)result.children.Add(ExportTree(child.gameObject));return result;
+        }
+        static List<Property> ExportProperties(UnityEngine.Object value)
+        {
+            using var serialized=new SerializedObject(value);var result=new List<Property>();var p=serialized.GetIterator();
+                while(p.Next(true))
+                {
+                    var item=new Property{path=p.propertyPath,type=p.propertyType.ToString(),text=""};
+                    switch(p.propertyType)
+                    {
+                        case SerializedPropertyType.Integer:case SerializedPropertyType.Enum:case SerializedPropertyType.LayerMask:item.integer=p.longValue;item.number=p.longValue;break;
+                        case SerializedPropertyType.Float:item.number=p.doubleValue;break;
+                        case SerializedPropertyType.Boolean:item.boolean=p.boolValue;break;
+                        case SerializedPropertyType.String:item.text=p.stringValue;break;
+                        case SerializedPropertyType.ObjectReference:item.reference=Reference(p.objectReferenceValue);break;
+                        case SerializedPropertyType.Color:var color=p.colorValue;item.vector=new[]{color.r,color.g,color.b,color.a};break;
+                        case SerializedPropertyType.Vector2:var v=p.vector2Value;item.vector=new[]{v.x,v.y};break;
+                        case SerializedPropertyType.Vector3:item.vector=V(p.vector3Value);break;
+                        case SerializedPropertyType.Vector4:var v4=p.vector4Value;item.vector=new[]{v4.x,v4.y,v4.z,v4.w};break;
+                    }
+                    result.Add(item);
+                }
+            return result;
+        }
+        static void ExportClip(AnimationClip clip,Asset asset)
+        {
+            asset.length=clip.length;asset.frameRate=clip.frameRate;asset.loop=AnimationUtility.GetAnimationClipSettings(clip).loopTime;
+            foreach(var binding in AnimationUtility.GetCurveBindings(clip))
+            {
+                var original=AnimationUtility.GetEditorCurve(clip,binding);var curve=new Curve{path=binding.path,type=binding.type.FullName,property=binding.propertyName,preWrap=(int)original.preWrapMode,postWrap=(int)original.postWrapMode};
+                foreach(var k in original.keys)curve.keys.Add(new Key{time=k.time,value=k.value,inTangent=float.IsInfinity(k.inTangent)?float.MaxValue:k.inTangent,outTangent=float.IsInfinity(k.outTangent)?float.MaxValue:k.outTangent,inWeight=k.inWeight,outWeight=k.outWeight,weightedMode=(int)k.weightedMode});
+                // Bake through Unity's evaluator, preserving weighted tangent semantics at the selected rate.
+                int count=Math.Max(1,Mathf.CeilToInt(clip.length*manifest.sampleRate));var times=Enumerable.Range(0,count+1).Select(i=>Mathf.Min(clip.length,i/manifest.sampleRate)).Concat(original.keys.Select(k=>k.time)).Distinct().OrderBy(v=>v);
+                foreach(float time in times)curve.samples.Add(new Sample{time=time,value=original.Evaluate(time)});asset.curves.Add(curve);
+            }
+            foreach(var binding in AnimationUtility.GetObjectReferenceCurveBindings(clip))
+            {var curve=new Curve{path=binding.path,type=binding.type.FullName,property=binding.propertyName,discrete=true};foreach(var k in AnimationUtility.GetObjectReferenceCurve(clip,binding))curve.samples.Add(new Sample{time=k.time,reference=Reference(k.value)});asset.curves.Add(curve);}
+            foreach(var e in AnimationUtility.GetAnimationEvents(clip))asset.events.Add(new Event{time=e.time,function=e.functionName,stringParameter=e.stringParameter,intParameter=e.intParameter,floatParameter=e.floatParameter,objectParameter=Reference(e.objectReferenceParameter)});
+        }
+        static void ExportController(AnimatorController controller,Asset asset)
+        {
+            foreach(var p in controller.parameters)asset.parameters.Add(new Parameter{name=p.name,type=p.type.ToString(),number=p.type==AnimatorControllerParameterType.Int?p.defaultInt:p.defaultFloat,boolean=p.defaultBool});
+            foreach(var layer in controller.layers)
+            {
+                var data=new Layer{name=layer.name,weight=layer.defaultWeight,blend=layer.blendingMode.ToString(),mask=Reference(layer.avatarMask),syncedLayer=layer.syncedLayerIndex};var ids=new Dictionary<AnimatorState,string>();
+                void Index(AnimatorStateMachine machine,string prefix){data.machines.Add(prefix);foreach(var state in machine.states)ids[state.state]=prefix+state.state.name;foreach(var child in machine.stateMachines)Index(child.stateMachine,prefix+child.stateMachine.name+"/");}
+                Index(layer.stateMachine,"");data.defaultState=layer.stateMachine.defaultState!=null?ids[layer.stateMachine.defaultState]:"";
+                void Transition(AnimatorStateTransition t,string from){data.transitions.Add(new Transition{from=from,to=t.destinationState!=null&&ids.TryGetValue(t.destinationState,out string id)?id:"",duration=t.duration,offset=t.offset,hasExitTime=t.hasExitTime,exitTime=t.exitTime,fixedDuration=t.hasFixedDuration,canTransitionToSelf=t.canTransitionToSelf,isExit=t.isExit,interruption=t.interruptionSource.ToString(),orderedInterruption=t.orderedInterruption,conditions=t.conditions.Select(c=>new Condition{parameter=c.parameter,mode=c.mode.ToString(),threshold=c.threshold}).ToList()});}
+                void States(AnimatorStateMachine machine,string prefix)
+                {
+                    foreach(var item in machine.states){var s=item.state;data.states.Add(new State{id=ids[s],machine=prefix,name=s.name,motion=Reference(s.motion),motionType=s.motion?.GetType().FullName??"",speed=s.speed,cycleOffset=s.cycleOffset,mirror=s.mirror,writeDefaultValues=s.writeDefaultValues,speedParameter=s.speedParameterActive?s.speedParameter:"",timeParameter=s.timeParameterActive?s.timeParameter:"",mirrorParameter=s.mirrorParameterActive?s.mirrorParameter:"",cycleOffsetParameter=s.cycleOffsetParameterActive?s.cycleOffsetParameter:"",behaviours=s.behaviours.Select(b=>b.GetType().FullName).ToList()});foreach(var t in s.transitions)Transition(t,ids[s]);}
+                    foreach(var t in machine.anyStateTransitions)Transition(t,prefix+"*");foreach(var child in machine.stateMachines)States(child.stateMachine,prefix+child.stateMachine.name+"/");
+                    if(machine.entryTransitions.Length>0||machine.GetStateMachineTransitions(machine).Length>0)manifest.issues.Add(controller.name+"/"+prefix+": entry/state-machine transitions require an adapter");
+                }
+                States(layer.stateMachine,"");asset.layers.Add(data);
+            }
+        }
+    }
+}
+#endif

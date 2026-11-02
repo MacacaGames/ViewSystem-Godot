@@ -1,7 +1,19 @@
-# Navigation contract
+# Navigation contract (0.7.0-dev)
 
-`ShowPageAsync` and `ShowOverlayAsync` use the same transaction whether or not
-`ProjectTransitions` is assigned. Calls on one host are serialized.
+The default `ViewCatalog.NavigationMode` is **UnityTiming**, as selected for the
+Unity migration. After preparation succeeds, commit ownership before entry and
+start outgoing retirement. WithPrevious overlaps entry; AfterPrevious waits for
+retirement up to MaximumWaitSeconds; Custom uses the authored delay. Cancellation
+or failure after commit does not restore the outgoing page. Cleanup still runs,
+and `ViewNavigationCommittedException` identifies the committed view.
+
+The numbered transaction below applies when **Transactional** is explicitly
+selected, with either native transitions or `ProjectTransitions`. Calls on one
+host are serialized. Direct async calls queue. Explicit options / the fluent
+builder can reject busy requests or enforce click protection; requests rejected
+by protection do not invoke their callbacks. A hook must not recursively await
+the same host's navigation.
+
 
 1. Await `BeforePrepareAsync`, assemble and inject the candidate and all new
    State instances, mount them, run entry lifecycle/animation/policy timing, and
@@ -44,3 +56,17 @@ navigation or shutdown on its own host while it holds that host's transaction.
 Healthy retained States keep their identity across matching groups. A State whose
 immediate entry Ready faulted or was cancelled is staged as a replacement on the
 next page navigation, so a failed entry does not poison future requests.
+
+
+Options may select navigation mode per request, ignore transitions/time scale,
+replay an already active ID, reuse an overlay, supply a mounted descendant root,
+override sorting, and observe OnStart / OnChanged / OnComplete. OnChanged occurs
+at commit; OnComplete only after entry and AfterReady succeed. Raw async calls
+without options preserve direct Task API queue/rebuild semantics. Fluent defaults
+reuse the same ID, enforce click protection and use unscaled transition time.
+
+Overlay State references include all live overlays plus the Page. Closing a
+middle overlay releases only its reference. Retained States receive the top
+active owner's context. Modal overlays suspend underlying focus and restore the
+previous valid focus owner when removed. Sibling order follows rendered order
+because ZIndex alone does not order native input.

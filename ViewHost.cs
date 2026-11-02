@@ -12,24 +12,33 @@ namespace MacacaGames.ViewSystem;
 public partial class ViewHost : Control
 {
     [Export] public ViewCatalog Catalog { get; set; } = null!;
-    [Export] public string InitialPage { get; set; } = "";
+    [Export,ViewId] public string InitialPage { get; set; } = "";
     [Export] public bool UsePreviewModels { get; set; }
     public ViewModels SharedModels { get; set; } = new();
+    [Export] public bool UseSimulatedSafeArea {get;set;}
+    [Export] public Rect2 SimulatedSafeArea {get;set;}=new(0,0,1,1);
+    public HashSet<string> ActiveBreakpoints { get; } = new(StringComparer.Ordinal);
     public List<IViewPageShowHook> ShowHooks { get; } = new();
     public ViewInstance? CurrentPage { get; private set; }
     public IReadOnlyList<ViewInstance> Overlays => overlays;
     public IReadOnlyDictionary<string, ViewInstance> States => states;
     public event Action<string, Control>? ActionRequested;
     public event Action<Exception>? Failed;
+    public event Action<ViewInstance>? NavigationCommitted;
+    private ulong? lastProtectedNavigation;
+    public event Action<ViewActionEvent>? ActionWithPayloadRequested;
     private readonly List<ViewInstance> overlays = new();
     private readonly Dictionary<string, ViewInstance> states = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim gate = new(1);
     private readonly CancellationTokenSource lifetime = new();
     private Control pageLayer = null!, stateLayer = null!, overlayLayer = null!;
     private bool initialized;
+    private ViewElementPool? elementPool;
+    public ViewElementPool ElementPool {get {Initialize();return elementPool!;}}
     public override void _Ready()
     {
         Initialize();
+        if(IsPrimaryHost&&EngineDebugger.IsActive()){var debug=(Node)GD.Load<GDScript>("res://addons/macaca_viewsystem/runtime_debugger.gd").New().AsGodotObject();AddChild(debug);debug.Call("setup",this);}
         if (!string.IsNullOrWhiteSpace(InitialPage)) _ = StartAsync();
     }
     private async Task StartAsync()
@@ -46,6 +55,7 @@ public partial class ViewHost : Control
         pageLayer = PagesPath.IsEmpty ? Layer("Pages") : GetNode<Control>(PagesPath);
         stateLayer = StatesPath.IsEmpty ? Layer("States") : GetNode<Control>(StatesPath);
         overlayLayer = OverlaysPath.IsEmpty ? Layer("Overlays") : GetNode<Control>(OverlaysPath);
+        elementPool=new ViewElementPool(this);elementPool.Destroying+=root=>ReleaseDescendants(root,true);
         initialized = true;
     }
     private Control Layer(string name)
@@ -72,14 +82,16 @@ public partial class ViewHost : Control
     }
     private ViewContext Context(ViewEntry entry, ViewModels? model)
         => new(model ?? (UsePreviewModels ? ViewModels.From(entry.PreviewModel) : new()),
-            UsePreviewModels ? ViewModels.From(Catalog.SharedPreviewModel) : SharedModels,
-            Dispatch: (action, origin) => ActionRequested?.Invoke(action, origin));
+            WithSingletons(UsePreviewModels ? ViewModels.From(Catalog.SharedPreviewModel) : SharedModels),
+            Dispatch: (action, origin) => ActionRequested?.Invoke(action, origin), ActiveBreakpoints: new HashSet<string>(ActiveBreakpoints,StringComparer.Ordinal), DispatchEvent: action=>ActionWithPayloadRequested?.Invoke(action), NormalizedSafeArea: GetNormalizedSafeArea(), GlobalSafeArea: Catalog.SafeArea);
 
-    public Task<ViewInstance> ShowPageAsync(string id, ViewModels? model = null, CancellationToken token = default)
-        => ShowAsync(id, false, model, token);
-    public Task<ViewInstance> ShowOverlayAsync(string id, ViewModels? model = null, CancellationToken token = default)
-        => ShowAsync(id, true, model, token);
-    private async Task<ViewInstance> ShowAsync(string id, bool overlay, ViewModels? model, CancellationToken token)
+    private ViewModels WithSingletons(ViewModels models){elementPool?.InjectSingletons(models);return models;}
+
+    public Task<ViewInstance> ShowPageAsync(string id, ViewModels? model = null, CancellationToken token = default,ViewNavigationOptions? options=null)
+        => ShowAsync(id, false, model, token,options);
+    public Task<ViewInstance> ShowOverlayAsync(string id, ViewModels? model = null, CancellationToken token = default,ViewNavigationOptions? options=null)
+        => ShowAsync(id, true, model, token,options);
+    private async Task<ViewInstance> ShowTransactionalAsync(string id, bool overlay, ViewModels? model, CancellationToken token,ViewNavigationOptions? options)
     {
         Initialize();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, token);
@@ -87,6 +99,9 @@ public partial class ViewHost : Control
         var entry = Entry(id, overlay ? ViewKind.Overlay : ViewKind.Page);
         var context = Context(entry, model);
         var request = new ViewPageShowContext(id, overlay, context);
+        Control? priorFocus=null;
+        if(options?.CustomRoot is {} custom&&(!custom.IsInsideTree()||!IsAncestorOf(custom)))throw new InvalidOperationException("CustomRoot must be a mounted descendant of this host.");
+        if(options?.WaitPreviousPageFinish==false&&gate.CurrentCount==0)throw new InvalidOperationException("A navigation transaction is already running.");
         await gate.WaitAsync(token);
         var invoked = new List<IViewPageShowHook>();
         var candidates = new List<ViewInstance>();
@@ -98,15 +113,27 @@ public partial class ViewHost : Control
         var cleanupErrors = new List<Exception>();
         try
         {
-            IsTransitioning = true;
-            foreach (var hook in ShowHooks.ToArray())
-            { token.ThrowIfCancellationRequested(); invoked.Add(hook); await hook.BeforePrepareAsync(request, token); }
+            if(options!=null&&!options.IgnoreClickProtection&&Catalog.BuiltInClickProtection)
+            {
+                ulong now=Time.GetTicksMsec();if(lastProtectedNavigation is {} protectedAt&&now-protectedAt<Catalog.MinimumTimeInterval*1000)throw new InvalidOperationException("ViewSystem click protection rejected a repeated navigation.");
+                lastProtectedNavigation=now;
+            }
+            if(!overlay&&options?.ReusePage==true&&!options.ReplayWhileSamePage&&CurrentPage?.Definition.Id==id)return CurrentPage;
+            if(overlay&&options?.ReuseOverlay==true&&!options.ReplayWhileSamePage&&overlays.LastOrDefault(v=>v.Definition.Id==id) is {} existing)return existing;
+            IsTransitioning = true;priorFocus=GetViewport().GuiGetFocusOwner();options?.OnStart?.Invoke();
+            var selectedHooks=ShowHooks.ToArray().Where(h=>h.ShouldHandle(request))
+                .OrderBy(h=>(h as IViewPageShowHookExecutionPolicy)?.Order??0).ToArray();
+            foreach (var hook in selectedHooks)
+            { token.ThrowIfCancellationRequested(); invoked.Add(hook); await RunHookAsync(hook,t=>hook.BeforePrepareAsync(request,t),token); }
+            foreach(var hook in invoked)
+                if(hook is IViewPageShowPhaseCallback phase)
+                    await RunHookAsync(hook,t=>phase.OnBeforePreparePhaseCompletedAsync(request,t),token);
             token.ThrowIfCancellationRequested();
-            result = Mount(entry, context, overlay ? overlayLayer : pageLayer); candidates.Add(result);
-            if (!overlay)
-                foreach (var definition in StateDefinitions(entry))
+            var scenes=await PrepareScenesAsync(entry,token);
+            foreach (var definition in StateDefinitions(entry))
                     if (StateNeedsCreation(definition.Id))
-                    { var state = Mount(definition, context, stateLayer); nextStates.Add(definition.Id, state); candidates.Add(state); }
+                    { var state = Mount(definition, context, stateLayer,scenes:scenes); nextStates.Add(definition.Id, state); candidates.Add(state); }
+            result = Mount(entry, context, options?.CustomRoot??(overlay ? overlayLayer : pageLayer),options,scenes); candidates.Add(result);
             foreach (var state in nextStates.Values)
             {
                 started.Add(state); state.Ready = EnterCandidateAsync(state, token);
@@ -115,26 +142,24 @@ public partial class ViewHost : Control
             started.Add(result); result.Ready = EnterCandidateAsync(result, token);
             await result.Ready;
             foreach (var hook in invoked)
-            { token.ThrowIfCancellationRequested(); await hook.AfterReadyAsync(request, token); }
+            { token.ThrowIfCancellationRequested(); await RunHookAsync(hook,t=>hook.AfterReadyAsync(request,t),token); }
             token.ThrowIfCancellationRequested();
 
-            if (overlay) { overlays.Add(result); committed = true; }
-            else
-            {
-                // No await or user callback is allowed between these ownership assignments.
-                var previous = CurrentPage;
-                var obsolete = states.Where(p => p.Value.Definition.State != entry.State || nextStates.ContainsKey(p.Key)).ToArray();
-                CurrentPage = result; PageReady = result.Ready; ++activationGeneration;
-                foreach (var pair in obsolete) states.Remove(pair.Key);
-                foreach (var pair in nextStates) states.Add(pair.Key, pair.Value);
-                committed = true;
-                foreach (var state in states.Values.Where(v => !nextStates.ContainsKey(v.Definition.Id)))
-                    try { state.Rebind(context); state.Lifecycle(p => p.RefreshView()); }
-                    catch (Exception error) { cleanupErrors.Add(error); }
-                foreach (var outgoing in obsolete.Select(p => p.Value).Concat(previous == null ? Array.Empty<ViewInstance>() : new[] { previous }))
-                    try { await RetireDelivered(outgoing, false); } catch (Exception error) { cleanupErrors.Add(error); }
-                if (cleanupErrors.Count > 0) throw new ViewNavigationCommittedException(entry.Id, false, cleanupErrors);
-            }
+            // Ownership commit contains no await or application callback.
+            var previous=overlay?options?.ReuseOverlay==true?overlays.LastOrDefault(v=>v.Definition.Id==id):null:CurrentPage;
+            if(overlay&&previous!=null)overlays.Remove(previous);
+            if(overlay)overlays.Add(result);
+            else{CurrentPage=result;PageReady=result.Ready;++activationGeneration;}
+            var obsolete=states.Where(p=>!StateGroupRequired(p.Value.Definition.State)||nextStates.ContainsKey(p.Key)).ToArray();
+            foreach(var pair in obsolete)states.Remove(pair.Key);
+            foreach(var pair in nextStates)states.Add(pair.Key,pair.Value);
+            committed=true;
+            try{CommitPresentation(result,priorFocus);NavigationCommitted?.Invoke(result);options?.OnChanged?.Invoke(result);}catch(Exception error){cleanupErrors.Add(error);}
+            foreach(var state in states.Values.Where(v=>!nextStates.ContainsKey(v.Definition.Id)))
+                try{state.Rebind(ContextForState(state));state.Lifecycle(p=>p.RefreshView());}catch(Exception error){cleanupErrors.Add(error);}
+            foreach(var outgoing in obsolete.Select(p=>p.Value).Concat(previous==null?Array.Empty<ViewInstance>():new[]{previous}))
+                try{await RetireDelivered(outgoing,outgoing.Definition.Kind==ViewKind.Overlay);}catch(Exception error){cleanupErrors.Add(error);}
+            if(cleanupErrors.Count>0)throw new ViewNavigationCommittedException(entry.Id,overlay,cleanupErrors);
         }
         catch (Exception error) { failure = error; }
         finally
@@ -161,14 +186,26 @@ public partial class ViewHost : Control
     }
     private bool StateNeedsCreation(string id)
         => !states.TryGetValue(id, out var state) || state.Ready.IsFaulted || state.Ready.IsCanceled;
+    private static async Task RunHookAsync(IViewPageShowHook hook,Func<CancellationToken,Task> run,CancellationToken token)
+    {
+        float seconds=(hook as IViewPageShowHookExecutionPolicy)?.TimeoutSeconds??0;
+        if(!float.IsFinite(seconds))throw new InvalidOperationException("Hook timeout must be finite.");
+        using var timeout=CancellationTokenSource.CreateLinkedTokenSource(token);
+        if(seconds>0)timeout.CancelAfter(TimeSpan.FromSeconds(seconds));
+        try { await run(timeout.Token).WaitAsync(timeout.Token); }
+        catch(OperationCanceledException error) when(!token.IsCancellationRequested&&timeout.IsCancellationRequested)
+        {throw new TimeoutException("ViewSystem hook timed out: "+hook.GetType().Name,error);}
+    }
     private IEnumerable<ViewEntry> StateDefinitions(ViewEntry page)
         => Catalog.Entries.Where(e => e.Kind == ViewKind.State && page.State.Length != 0 && e.State == page.State);
-    private ViewInstance Mount(ViewEntry entry, ViewContext context, Control layer)
+    private ViewInstance Mount(ViewEntry entry, ViewContext context, Control layer,ViewNavigationOptions? options=null,IReadOnlyDictionary<string,PackedScene>? scenes=null)
     {
-        var instance = CreateOwned(entry, context);
+        var instance = CreateOwned(entry, context,scenes);
         try
         {
-            instance.ValidateAnimations(); instance.Root.Visible = false; layer.AddChild(instance.Root);
+            instance.SkipTransitions=options?.IgnoreTransition??false;instance.IgnoreTimeScale=options?.IgnoreTimeScale;
+            if(options?.SortOrder is {} order)instance.Order=order;
+            if(!instance.SkipTransitions)instance.ValidateAnimations(); instance.Root.Visible = false; layer.AddChild(instance.Root); instance.MountLayout();
             return instance;
         }
         catch (Exception failure)
@@ -182,17 +219,17 @@ public partial class ViewHost : Control
     }
     private void BeginEntry(ViewInstance instance)
     {
-        instance.Lifecycle(p => p.OnBeforeShow()); instance.Root.Show(); instance.Lifecycle(p => p.OnStartShow());
+        instance.HasEntered=true;instance.Lifecycle(p=>p.OnChangePage(true)); instance.Lifecycle(p => p.OnBeforeShow()); instance.Root.Show(); instance.Lifecycle(p => p.OnStartShow());
     }
     private async Task EnterCandidateAsync(ViewInstance instance, CancellationToken token)
     {
         token.ThrowIfCancellationRequested(); BeginEntry(instance);
         await instance.AnimateAsync(true, token);
-        double duration = instance.Definition.Kind == ViewKind.Overlay ? ProjectTransitions?.OverlayEnterDuration(instance.Root) ?? 0 :
+        double duration = instance.SkipTransitions?0:instance.Definition.Kind == ViewKind.Overlay ? ProjectTransitions?.OverlayEnterDuration(instance.Root) ?? 0 :
             instance.Definition.Kind == ViewKind.Page ? ProjectTransitions?.EnterDuration(instance.Root) ?? 0 : 0;
         ValidateDuration(duration);
-        if (duration > 0) await ViewController.TweenDelay(instance.Root, duration, token);
-        token.ThrowIfCancellationRequested(); instance.Lifecycle(p => p.OnShown());
+        if (duration > 0) await ViewController.TweenDelay(instance.Root, duration, token,instance.IgnoreTimeScale??false);
+        token.ThrowIfCancellationRequested(); instance.Lifecycle(p => {p.OnShown();p.OnChangedPage();});
     }
     private static void ValidateDuration(double duration)
     { if (!double.IsFinite(duration) || duration < 0) throw new InvalidOperationException("Invalid entry duration."); }
@@ -213,13 +250,17 @@ public partial class ViewHost : Control
         try
         {
             if (!overlays.Remove(overlay)) throw new InvalidOperationException("Overlay does not belong to this host.");
-            await RetireDelivered(overlay, true);
+            await RetireDelivered(overlay, true); await ReconcileStatesAsync(); RestoreFocus(overlay);
         }
         finally { gate.Release(); }
     }
     public override void _ExitTree()
     {
-        lifetime.Cancel();
+        var errors=new List<Exception>();
+        try{lifetime.Cancel();}catch(Exception error){errors.Add(error);}
+        try{elementPool?.CancelLifetimes();}catch(Exception error){errors.Add(error);}
+        finally{ReleaseFrameRate();}
+        if(errors.Count>0)throw new AggregateException("ViewHost exit reported cleanup errors.",errors);
         // Godot owns child-node destruction. Cancellation wakes outstanding hooks/animations.
     }
 }
